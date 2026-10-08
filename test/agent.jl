@@ -43,8 +43,9 @@ function close_test_agent(test)
     close_agent!(test.agent)
 end
 
-make_test_settings(turns; kwargs...) =
-    AgentSettings(; start_claude = make_fake_starter(turns; kwargs...), read_sign_in = command -> true)
+make_test_settings(turns; thinking_display = true, kwargs...) =
+    AgentSettings(; start_claude = make_fake_starter(turns; kwargs...), read_sign_in = command -> true,
+                  read_thinking_display = command -> thinking_display)
 
 open_test_session(test; mcp_servers = [], cwd = TEST_FOLDER) =
     ACP.send_request!(test.connection, ACP.NewSessionRequest(cwd = cwd, mcp_servers = mcp_servers); timeout = 10)
@@ -86,6 +87,7 @@ collect_text(updates, type) = join(update.content.text for update in updates if 
         @test arguments[findfirst(==("--session-id"), arguments) + 1] == session.session_id
         @test arguments[findfirst(==("--permission-prompt-tool"), arguments) + 1] == ClaudeCodeACP.PERMISSION_TOOL_NAME
         @test JSON.parse(arguments[findfirst(==("--settings"), arguments) + 1]) == Dict("showThinkingSummaries" => true)
+        @test arguments[findfirst(==("--thinking-display"), arguments) + 1] == "summarized"
         @test !("--strict-mcp-config" in arguments)
         @test fake.directory == TEST_FOLDER
         # The secrets are in a file that only this user reads, not on the command line.
@@ -103,9 +105,14 @@ collect_text(updates, type) = join(update.content.text for update in updates if 
         close_test_agent(test)
 
         strict = open_test_agent(AgentSettings(start_claude = make_fake_starter([]; fakes),
-                                               read_sign_in = command -> true, strict_mcp_config = true))
+                                               read_sign_in = command -> true, strict_mcp_config = true,
+                                               read_thinking_display = command -> false))
         open_test_session(strict)
         @test "--strict-mcp-config" in last(fakes).arguments
+        # A claude that does not take the flag does not get it.
+        @test !("--thinking-display" in last(fakes).arguments)
+        # A claude that does not take the flag does not get it.
+        @test !("--thinking-display" in last(fakes).arguments)
         close_test_agent(strict)
     end
 

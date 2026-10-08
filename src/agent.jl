@@ -12,6 +12,8 @@
   answers its `ClaudeProcess`; a test gives a fake.
 - `read_sign_in(claude_command)` — answers whether `claude` is signed in, or
   `nothing` when it can not tell.
+- `read_thinking_display(claude_command)` — answers whether `claude` takes the
+  flag `--thinking-display`.
 """
 Base.@kwdef struct AgentSettings
     claude_command::Vector{String} = ["claude"]
@@ -19,6 +21,7 @@ Base.@kwdef struct AgentSettings
     start_claude::Function = (arguments, directory; capabilities = String[]) ->
         open_claude_process(Cmd(Cmd(arguments); dir = directory); capabilities)
     read_sign_in::Function = read_claude_sign_in
+    read_thinking_display::Function = read_claude_thinking_display
 end
 
 """
@@ -63,11 +66,12 @@ mutable struct ClaudeCodeAgent <: ACP.AgentHandler
     sessions::Dict{String,ClaudeSession}
     permission::Union{Nothing,PermissionServer}
     connection::Union{Nothing,ACP.Connection}
+    has_thinking_display::Union{Nothing,Bool}
     lock::ReentrantLock
 end
 
 ClaudeCodeAgent(settings::AgentSettings = AgentSettings()) =
-    ClaudeCodeAgent(settings, Dict{String,ClaudeSession}(), nothing, nothing, ReentrantLock())
+    ClaudeCodeAgent(settings, Dict{String,ClaudeSession}(), nothing, nothing, nothing, ReentrantLock())
 
 # --- The options of a session ------------------------------------------------
 
@@ -107,8 +111,9 @@ make_config_options(session::ClaudeSession) = ACP.SessionConfigOption[
     make_claude_arguments(agent, session, mcp_config_path) -> Vector{String}
 
 The command line of the `claude` of a session: print mode with stream-json in
-and out, the stream of partial messages, the text of the thinking, the
-permission tool, the session id or the session to resume, the options that the
+and out, the stream of partial messages, the text of the thinking with the
+setting `showThinkingSummaries` and, when `claude` takes it, the flag
+`--thinking-display summarized`, the permission tool, the session id or the session to resume, the options that the
 person chose, and the file of the MCP configuration, which holds the secrets
 and so is not on the command line.
 """
@@ -118,6 +123,7 @@ function make_claude_arguments(agent::ClaudeCodeAgent, session::ClaudeSession, m
                        "--include-partial-messages",
                        "--settings", JSON.json(Dict("showThinkingSummaries" => true)),
                        "--permission-prompt-tool", PERMISSION_TOOL_NAME]
+    _has_thinking_display!(agent) && append!(arguments, ["--thinking-display", "summarized"])
     append!(arguments, session.has_history ? ["--resume", session.id] : ["--session-id", session.id])
     for option in SESSION_OPTIONS
         option.id in session.chosen_options || continue
@@ -226,6 +232,41 @@ function read_claude_sign_in(claude_command::Vector{String})
     end
     signed_in = status isa AbstractDict ? get(status, "loggedIn", nothing) : nothing
     signed_in isa Bool ? signed_in : nothing
+end
+
+"""
+    read_claude_thinking_display(claude_command) -> Bool
+
+Whether `claude` takes the flag `--thinking-display`, which a recent model
+needs to stream the summary of its thinking in print mode, and which the help
+of `claude` does not list. A `claude` that knows the flag refuses a wrong value
+of it and names the flag; one that does not know it prints its version.
+"""
+function read_claude_thinking_display(claude_command::Vector{String})
+    errors = IOBuffer()
+    command = Cmd(Cmd([claude_command..., "--thinking-display", "no-such-display", "--version"]);
+                  env = make_claude_environment(), ignorestatus = true)
+    process = try
+        run(pipeline(command; stdout = devnull, stderr = errors); wait = false)
+    catch exception
+        exception isa Base.IOError || rethrow()
+        return false
+    end
+    if timedwait(() -> process_exited(process), 20.0) !== :ok
+        kill(process)
+        return false
+    end
+    wait(process)
+    process.exitcode != 0 && occursin("--thinking-display", String(take!(errors)))
+end
+
+# Whether the command line of `claude` gets `--thinking-display`, read once.
+function _has_thinking_display!(agent::ClaudeCodeAgent)
+    known = lock(() -> agent.has_thinking_display, agent.lock)
+    known === nothing || return known
+    found = agent.settings.read_thinking_display(agent.settings.claude_command)
+    lock(() -> agent.has_thinking_display = found, agent.lock)
+    found
 end
 
 function _require_sign_in(agent::ClaudeCodeAgent)

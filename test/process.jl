@@ -39,6 +39,15 @@ end
         @test ClaudeCodeACP.read_claude_sign_in(["claude-code-acp-no-such-program"]) === nothing
     end
 
+    @testset "the flag of the thinking display comes from the refusal of a wrong value" begin
+        knows(flag_known) = ["sh", "-c", flag_known ?
+            "echo \"error: option '--thinking-display <display>' argument 'x' is invalid.\" >&2; exit 1" :
+            "echo 2.1.285; exit 0", "claude"]
+        @test ClaudeCodeACP.read_claude_thinking_display(knows(true)) === true
+        @test ClaudeCodeACP.read_claude_thinking_display(knows(false)) === false
+        @test ClaudeCodeACP.read_claude_thinking_display(["claude-code-acp-no-such-program"]) === false
+    end
+
     @testset "the program prints its usage" begin
         @test redirect_stdout(() -> ClaudeCodeACP.main(["--help"]), devnull) == 0
         @test redirect_stderr(() -> ClaudeCodeACP.main(["--no-such-flag"]), devnull) == 2

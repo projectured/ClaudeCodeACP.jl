@@ -96,8 +96,11 @@ editor ──ACP──▶ claude-code-acp ──stream-json──▶ claude -p  
   stream-json --include-partial-messages`, with `--session-id` for a new
   session and `--resume` for a session that the editor resumes. A change of an
   option starts it again with `--resume` and the new flag.
-- The agent passes the setting `showThinkingSummaries`, so the thinking streams
-  as text.
+- The agent passes the setting `showThinkingSummaries` and, when `claude` takes
+  it, the flag `--thinking-display summarized`, so the thinking of a recent
+  model streams as text. The help of `claude` does not list that flag, so the
+  agent checks it once with a wrong value, which a `claude` that knows the flag
+  refuses.
 - The agent serves a small MCP server on the loopback address, and gives Claude
   Code its tool with `--permission-prompt-tool`. Each session has its own
   random bearer secret for it.
