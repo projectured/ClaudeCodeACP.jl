@@ -1,0 +1,27 @@
+name = "ClaudeCodeACP"
+uuid = "397ce549-bc36-418a-97e7-6295a63dbdc4"
+version = "0.1.0"
+authors = []
+
+[deps]
+AgentClientProtocol = "9897b34e-e318-42ec-8700-51bd28135f60"
+HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
+JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
+UUIDs = "cf7118a7-6976-5b1a-9a39-7adc72f591a4"
+
+[compat]
+AgentClientProtocol = "0.1"
+HTTP = "1"
+JSON = "1"
+Random = "1"
+Sockets = "1"
+UUIDs = "1"
+julia = "1.12"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test"]
