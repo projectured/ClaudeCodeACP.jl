@@ -44,10 +44,10 @@ function close_test_agent(test)
 end
 
 make_test_settings(turns; kwargs...) =
-    AgentSettings(; start_claude = make_fake_starter(turns; kwargs...), check_sign_in = command -> true)
+    AgentSettings(; start_claude = make_fake_starter(turns; kwargs...), read_sign_in = command -> true)
 
-open_test_session(test; mcp_servers = []) =
-    ACP.send_request!(test.connection, ACP.NewSessionRequest(cwd = "/work", mcp_servers = mcp_servers); timeout = 10)
+open_test_session(test; mcp_servers = [], cwd = TEST_FOLDER) =
+    ACP.send_request!(test.connection, ACP.NewSessionRequest(cwd = cwd, mcp_servers = mcp_servers); timeout = 10)
 
 send_test_prompt(test, session_id, text) =
     ACP.send_request!(test.connection, ACP.PromptRequest(session_id = session_id,
@@ -57,7 +57,7 @@ collect_text(updates, type) = join(update.content.text for update in updates if 
 
 @testset "the agent" begin
     @testset "initialize names the agent and the way to sign in" begin
-        agent = ClaudeCodeAgent(AgentSettings(check_sign_in = command -> true))
+        agent = ClaudeCodeAgent(AgentSettings(read_sign_in = command -> true))
         to_agent, to_client = Base.BufferStream(), Base.BufferStream()
         ACP.open_connection(agent, to_agent, to_client)
         connection = ACP.open_connection(TestClient(), to_client, to_agent)
@@ -87,7 +87,10 @@ collect_text(updates, type) = join(update.content.text for update in updates if 
         @test arguments[findfirst(==("--permission-prompt-tool"), arguments) + 1] == ClaudeCodeACP.PERMISSION_TOOL_NAME
         @test JSON.parse(arguments[findfirst(==("--settings"), arguments) + 1]) == Dict("showThinkingSummaries" => true)
         @test !("--strict-mcp-config" in arguments)
-        @test fake.directory == "/work"
+        @test fake.directory == TEST_FOLDER
+        # The secrets are in a file that only this user reads, not on the command line.
+        @test filemode(read_mcp_config_path(fake)) & 0o777 == 0o600
+        @test !any(argument -> occursin("Bearer", argument), arguments)
         servers = read_mcp_config(fake)["mcpServers"]
         @test servers["projectured"] == Dict{String,Any}("type" => "http", "url" => "http://127.0.0.1:20000/mcp",
                                                         "headers" => Dict{String,Any}("Authorization" => "Bearer editor"))
@@ -100,7 +103,7 @@ collect_text(updates, type) = join(update.content.text for update in updates if 
         close_test_agent(test)
 
         strict = open_test_agent(AgentSettings(start_claude = make_fake_starter([]; fakes),
-                                               check_sign_in = command -> true, strict_mcp_config = true))
+                                               read_sign_in = command -> true, strict_mcp_config = true))
         open_test_session(strict)
         @test "--strict-mcp-config" in last(fakes).arguments
         close_test_agent(strict)
@@ -225,6 +228,17 @@ collect_text(updates, type) = join(update.content.text for update in updates if 
         @test failure isa ACP.ProtocolException
         @test failure.message == "Not logged in · Please run /login"
         close_test_agent(test)
+
+        # The events of a failed turn do not reach the next prompt: claude starts again.
+        fakes = FakeClaude[]
+        test = open_test_agent(make_test_settings([vcat(read_recorded("tool-call.jsonl")[1:3],
+                                                        make_result_turn("bad"; is_error = true)),
+                                                   make_result_turn("good")]; fakes))
+        session = open_test_session(test)
+        @test_throws ACP.ProtocolException send_test_prompt(test, session.session_id, "One.")
+        @test send_test_prompt(test, session.session_id, "Two.").stop_reason == "end_turn"
+        @test length(fakes) == 2
+        close_test_agent(test)
     end
 
     @testset "a claude that ends in a turn gives an error, and the next prompt starts it again" begin
@@ -245,7 +259,7 @@ collect_text(updates, type) = join(update.content.text for update in updates if 
     end
 
     @testset "a session needs the sign-in of claude" begin
-        test = open_test_agent(AgentSettings(start_claude = make_fake_starter([]), check_sign_in = command -> false))
+        test = open_test_agent(AgentSettings(start_claude = make_fake_starter([]), read_sign_in = command -> false))
         failure = try
             open_test_session(test)
         catch exception
@@ -262,12 +276,12 @@ collect_text(updates, type) = join(update.content.text for update in updates if 
         session = open_test_session(test)
         ACP.send_request!(test.connection, ACP.PromptRequest(session_id = session.session_id, prompt = [
             ACP.TextContent(text = "Look at"),
-            ACP.ResourceLink(name = "a.jl", uri = "file:///work/a.jl"),
+            ACP.ResourceLink(name = "a b.jl", uri = "file:///work/a%20b.jl"),
             ACP.EmbeddedResource(resource = ACP.TextResourceContents(uri = "file:///work/b.jl", text = "x = 1"))]);
             timeout = 10)
         message = only(m for m in only(fakes).received if m["type"] == "user")
         @test [block["text"] for block in message["message"]["content"]] ==
-              ["Look at", "@/work/a.jl", "<context ref=\"file:///work/b.jl\">\nx = 1\n</context>"]
+              ["Look at", "@/work/a b.jl", "<context ref=\"file:///work/b.jl\">\nx = 1\n</context>"]
         image = try
             ACP.send_request!(test.connection, ACP.PromptRequest(session_id = session.session_id,
                 prompt = [ACP.ImageContent(data = "", mime_type = "image/png")]); timeout = 10)
@@ -300,6 +314,89 @@ collect_text(updates, type) = join(update.content.text for update in updates if 
         @test [option.kind for option in question.options] == ["allow_always", "allow_once", "reject_once"]
         # Outside a prompt nobody can answer, so the call is denied.
         @test call_permission_tool(only(fakes), "Read", Dict{String,Any}("file_path" => "/a"))["behavior"] == "deny"
+        close_test_agent(test)
+    end
+
+    @testset "a folder that does not exist, and a claude that can not start" begin
+        test = open_test_agent(make_test_settings([]))
+        missing_folder = try
+            open_test_session(test; cwd = joinpath(TEST_FOLDER, "no-such-folder"))
+        catch exception
+            exception
+        end
+        @test missing_folder.code == ACP.INVALID_PARAMS
+        close_test_agent(test)
+        test = open_test_agent(AgentSettings(claude_command = ["claude-code-acp-no-such-program"],
+                                             read_sign_in = command -> true))
+        failure = try
+            open_test_session(test)
+        catch exception
+            exception
+        end
+        @test failure.code == ACP.INTERNAL_ERROR
+        @test occursin("can not start", failure.message)
+        @test !occursin("Bearer", failure.message)
+        @test !occursin("--mcp-config", failure.message)
+        close_test_agent(test)
+    end
+
+    @testset "a close cancels the prompt that runs" begin
+        fakes = FakeClaude[]
+        session_id = Ref("")
+        test_connection = Ref{Any}(nothing)
+        client = TestClient(on_update = (client, update) -> begin
+            update isa ACP.AgentMessageChunk && count(u -> u isa ACP.AgentMessageChunk, client.updates) == 1 &&
+                @async ACP.send_request!(test_connection[], ACP.CloseSessionRequest(session_id = session_id[]); timeout = 10)
+        end)
+        test = open_test_agent(make_test_settings([read_recorded("interrupted.jsonl")]; fakes); client)
+        test_connection[] = test.connection
+        session = open_test_session(test)
+        session_id[] = session.session_id
+        @test send_test_prompt(test, session.session_id, "Count to 300.").stop_reason == "cancelled"
+        @test any(message -> message["type"] == "control_request", only(fakes).received)
+        closed = try
+            send_test_prompt(test, session.session_id, "Again.")
+        catch exception
+            exception
+        end
+        @test closed.code == ACP.INVALID_PARAMS
+        close_test_agent(test)
+    end
+
+    @testset "a cancel during a start of claude ends the prompt before claude gets it" begin
+        gate = Channel{Bool}(1)
+        fakes = FakeClaude[]
+        test = open_test_agent(make_test_settings([make_result_turn("one"), make_result_turn("two")]; fakes, gate))
+        put!(gate, true)
+        session = open_test_session(test)
+        ACP.send_request!(test.connection, ACP.SetSessionConfigOptionRequestValueId(
+            session_id = session.session_id, config_id = "model", value = "haiku"); timeout = 10)
+        prompt = @async send_test_prompt(test, session.session_id, "One.")
+        # The prompt waits in the start of the new claude; the cancel comes then.
+        @test timedwait(() -> lock(() -> test.agent.sessions[session.session_id].is_prompting,
+                                   test.agent.sessions[session.session_id].lock), 10.0) === :ok
+        ACP.send_notification!(test.connection, ACP.CancelNotification(session_id = session.session_id))
+        sleep(0.2)
+        put!(gate, true)
+        @test fetch(prompt).stop_reason == "cancelled"
+        @test !any(message -> message["type"] == "user", last(fakes).received)
+        put!(gate, true)
+        @test send_test_prompt(test, session.session_id, "Two.").stop_reason == "end_turn"
+        close_test_agent(test)
+    end
+
+    @testset "a call after a cancel is denied without a question" begin
+        test = open_test_agent(make_test_settings([]))
+        session = open_test_session(test)
+        agent_session = test.agent.sessions[session.session_id]
+        lock(agent_session.lock) do
+            agent_session.is_prompting = true
+            agent_session.is_cancelled = true
+        end
+        decision = ClaudeCodeACP.decide_permission!(test.agent, agent_session, "Bash",
+                                                    Dict{String,Any}("command" => "ls"), "t")
+        @test decision["behavior"] == "deny"
+        @test isempty(test.client.questions)
         close_test_agent(test)
     end
 

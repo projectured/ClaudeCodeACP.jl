@@ -25,11 +25,11 @@ mutable struct PermissionServer
 end
 
 """
-    start_permission_server(find_session, decide) -> PermissionServer
+    start_permission_server!(find_session, decide) -> PermissionServer
 
 Start the server on a port that no other program holds.
 """
-function start_permission_server(find_session::Function, decide::Function)
+function start_permission_server!(find_session::Function, decide::Function)
     listener = Sockets.listen(Sockets.localhost, 0)
     port = Int(last(Sockets.getsockname(listener)))
     permission = PermissionServer(nothing, port, find_session, decide)
@@ -38,7 +38,12 @@ function start_permission_server(find_session::Function, decide::Function)
     permission
 end
 
-stop_permission_server!(permission::PermissionServer) = (close(permission.server); nothing)
+"""
+    stop_permission_server!(permission)
+
+Stop the server at once, also while a question waits for the person.
+"""
+stop_permission_server!(permission::PermissionServer) = (HTTP.forceclose(permission.server); nothing)
 
 """
     make_permission_mcp_server(permission, secret) -> Dict
@@ -89,7 +94,15 @@ function _answer_http_request(permission::PermissionServer, request::HTTP.Reques
     end
     message isa Dict{String,Any} || return HTTP.Response(400)
     haskey(message, "id") || return HTTP.Response(202)
-    result = _answer_mcp_request(permission, session, message)
+    # A failure answers an error that quotes nothing of the request, whose input
+    # can hold the content of a file.
+    result = try
+        _answer_mcp_request(permission, session, message)
+    catch exception
+        exception isa InterruptException && rethrow()
+        @warn "The permission tool failed to answer." exception = nameof(typeof(exception))
+        Dict{String,Any}("error" => Dict{String,Any}("code" => -32603, "message" => "The permission tool failed."))
+    end
     HTTP.Response(200, ["Content-Type" => "application/json"],
                   JSON.json(merge(Dict{String,Any}("jsonrpc" => "2.0", "id" => message["id"]), result)))
 end

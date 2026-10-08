@@ -16,7 +16,7 @@ into the updates of the session:
 - each tool call, with its title, its kind, its file, and a diff for an edit;
 - the plan, from the task list of Claude Code;
 - the commands, the usage of the context and the cost estimate;
-- the title of the session, from its first prompt.
+- the title of the session, from the first prompt that it gets.
 
 Before Claude Code runs a tool that needs your word, the agent asks the editor,
 which shows you the question with "Allow", "Always allow" and "Reject". A cancel
@@ -66,9 +66,9 @@ The program takes these arguments:
 | `--claude=PATH` | The program of Claude Code, when it is not `claude` on the `PATH`. |
 | `--login` | Run `claude auth login` in this terminal. An editor runs it for its sign-in button. |
 
-Without `--strict-mcp-config`, a session loads your configuration of Claude
-Code, as `claude` does in a terminal: your settings, skills, commands,
-`CLAUDE.md` files and claude.ai connectors.
+A session loads your configuration of Claude Code, as `claude` does in a
+terminal: your settings, skills, commands and `CLAUDE.md` files, and, without
+`--strict-mcp-config`, your MCP servers and claude.ai connectors too.
 
 ## Use it from Julia
 

@@ -30,17 +30,20 @@ read_recorded(name) = Dict{String,Any}[JSON.parse(line; dicttype = Dict{String,A
 A `start_claude` for `AgentSettings`: each start makes a `FakeClaude` with the
 script `turns` and pushes it to `fakes`.
 """
-function make_fake_starter(turns; on_call::Function = fake -> nothing, fakes::Vector{FakeClaude} = FakeClaude[])
+function make_fake_starter(turns; on_call::Function = fake -> nothing, fakes::Vector{FakeClaude} = FakeClaude[],
+                           gate::Union{Nothing,Channel} = nothing)
     script = [copy(turn) for turn in turns]
     next_turn = Ref(0)
-    (arguments, directory) -> begin
+    (arguments, directory; capabilities = String[]) -> begin
+        # A test can hold a start until it puts into `gate`.
+        gate === nothing || take!(gate)
         fake = FakeClaude(arguments, directory, Base.BufferStream(), Base.BufferStream(),
                           script, next_turn, Dict{String,Any}[], Channel{Bool}(Inf), on_call)
         push!(fakes, fake)
         messages = Channel{Dict{String,Any}}(Inf)
         errormonitor(@async _read_fake_input(fake, messages))
         errormonitor(@async _play_fake_turns(fake, messages))
-        ClaudeCodeACP.open_claude_process((fake.to_claude, fake.from_claude))
+        ClaudeCodeACP.open_claude_process((fake.to_claude, fake.from_claude); capabilities)
     end
 end
 
@@ -84,11 +87,12 @@ function _play_fake_turns(fake::FakeClaude, messages::Channel)
     end
 end
 
-# The MCP configuration that the agent gave the fake.
-function read_mcp_config(fake::FakeClaude)
-    index = findfirst(==("--mcp-config"), fake.arguments)
-    JSON.parse(fake.arguments[index + 1]; dicttype = Dict{String,Any})
-end
+# The MCP configuration that the agent gave the fake, in its file.
+read_mcp_config_path(fake::FakeClaude) = fake.arguments[findfirst(==("--mcp-config"), fake.arguments) + 1]
+read_mcp_config(fake::FakeClaude) = JSON.parse(read(read_mcp_config_path(fake), String); dicttype = Dict{String,Any})
+
+# A folder that exists, for the sessions of the tests.
+const TEST_FOLDER = mktempdir()
 
 # A call of the permission tool, as `claude` makes it: the decision, or the
 # HTTP status of a refused request.

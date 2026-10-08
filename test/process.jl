@@ -33,10 +33,10 @@ end
 
     @testset "the sign-in comes from the field loggedIn" begin
         status(text) = ["sh", "-c", "printf '%s' '$(text)'", "claude"]
-        @test ClaudeCodeACP.check_claude_sign_in(status("""{"loggedIn": true, "email": "a@b.c"}""")) === true
-        @test ClaudeCodeACP.check_claude_sign_in(status("""{"loggedIn": false}""")) === false
-        @test ClaudeCodeACP.check_claude_sign_in(status("not json")) === nothing
-        @test ClaudeCodeACP.check_claude_sign_in(["claude-code-acp-no-such-program"]) === nothing
+        @test ClaudeCodeACP.read_claude_sign_in(status("""{"loggedIn": true, "email": "a@b.c"}""")) === true
+        @test ClaudeCodeACP.read_claude_sign_in(status("""{"loggedIn": false}""")) === false
+        @test ClaudeCodeACP.read_claude_sign_in(status("not json")) === nothing
+        @test ClaudeCodeACP.read_claude_sign_in(["claude-code-acp-no-such-program"]) === nothing
     end
 
     @testset "the program prints its usage" begin

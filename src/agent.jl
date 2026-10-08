@@ -2,39 +2,43 @@
 # with its own `claude` process.
 
 """
-    AgentSettings(; claude_command, strict_mcp_config, start_claude, check_sign_in)
+    AgentSettings(; claude_command, strict_mcp_config, start_claude, read_sign_in)
 
 - `claude_command`    — the program `claude` and its first arguments.
 - `strict_mcp_config` — give `claude` only the MCP servers of the editor and the
   permission tool, with `--strict-mcp-config`, and not the MCP servers and the
   connectors of the configuration of the person.
-- `start_claude(arguments, directory)` — starts `claude` and answers its
-  `ClaudeProcess`; a test gives a fake.
-- `check_sign_in(claude_command)` — answers whether `claude` is signed in, or
+- `start_claude(arguments, directory; capabilities)` — starts `claude` and
+  answers its `ClaudeProcess`; a test gives a fake.
+- `read_sign_in(claude_command)` — answers whether `claude` is signed in, or
   `nothing` when it can not tell.
 """
 Base.@kwdef struct AgentSettings
     claude_command::Vector{String} = ["claude"]
     strict_mcp_config::Bool = false
-    start_claude::Function = (arguments, directory) -> open_claude_process(Cmd(Cmd(arguments); dir = directory))
-    check_sign_in::Function = check_claude_sign_in
+    start_claude::Function = (arguments, directory; capabilities = String[]) ->
+        open_claude_process(Cmd(Cmd(arguments); dir = directory); capabilities)
+    read_sign_in::Function = read_claude_sign_in
 end
 
 """
     ClaudeSession
 
 One session of the agent: its id, which is also the session id of `claude`, its
-folder, the MCP servers of the editor, the secret of its permission tool, its
-options, its `claude` process, and the state of its turns.
+folder, the MCP servers of the editor, the secret of its permission tool and
+the private folder of its MCP configuration, its options, its `claude` process,
+and the state of its turns.
 """
 mutable struct ClaudeSession
     id::String
     directory::String
     mcp_servers::Vector{Any}
     secret::String
+    config_folder::String
     options::Dict{String,String}
     chosen_options::Set{String}
     process::Union{Nothing,ClaudeProcess}
+    capabilities::Vector{String}
     has_history::Bool
     needs_restart::Bool
     title::Union{Nothing,String}
@@ -43,6 +47,7 @@ mutable struct ClaudeSession
     state::TurnState
     is_prompting::Bool
     is_cancelled::Bool
+    is_closed::Bool
     waiting_permissions::Vector{ACP.OutgoingRequest}
     lock::ReentrantLock
 end
@@ -66,9 +71,9 @@ ClaudeCodeAgent(settings::AgentSettings = AgentSettings()) =
 
 # --- The options of a session ------------------------------------------------
 
-# Each option: its id, its name, its category, and its values with their names.
-# The value "default" gives `claude` no flag, so the configuration of the person
-# decides.
+# Each option: its id, its name, its category, its flag, and its values with
+# their names. The value "default" gives `claude` no flag, so the configuration
+# of the person decides.
 const SESSION_OPTIONS = [
     (id = "mode", name = "Mode", category = "mode", flag = "--permission-mode",
      values = ["default" => "Ask before edits", "acceptEdits" => "Accept edits", "plan" => "Plan",
@@ -96,23 +101,18 @@ make_config_options(session::ClaudeSession) = ACP.SessionConfigOption[
                                                 for (value, name) in option.values])
     for option in SESSION_OPTIONS]
 
-# --- The arguments of `claude` -----------------------------------------------
+# --- The command line of `claude` --------------------------------------------
 
 """
-    make_claude_arguments(agent, session) -> Vector{String}
+    make_claude_arguments(agent, session, mcp_config_path) -> Vector{String}
 
 The command line of the `claude` of a session: print mode with stream-json in
 and out, the stream of partial messages, the text of the thinking, the
 permission tool, the session id or the session to resume, the options that the
-person chose, and the MCP servers.
+person chose, and the file of the MCP configuration, which holds the secrets
+and so is not on the command line.
 """
-function make_claude_arguments(agent::ClaudeCodeAgent, session::ClaudeSession)
-    servers = Dict{String,Any}()
-    for server in session.mcp_servers
-        config = _make_mcp_server_config(server)
-        config === nothing || (servers[first(config)] = last(config))
-    end
-    servers[PERMISSION_SERVER_NAME] = make_permission_mcp_server(_get_permission_server!(agent), session.secret)
+function make_claude_arguments(agent::ClaudeCodeAgent, session::ClaudeSession, mcp_config_path::String)
     arguments = String[agent.settings.claude_command..., "-p",
                        "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
                        "--include-partial-messages",
@@ -126,8 +126,36 @@ function make_claude_arguments(agent::ClaudeCodeAgent, session::ClaudeSession)
         append!(arguments, [option.flag, option.id == "mode" && value == "default" ? DEFAULT_MODE_FLAG_VALUE : value])
     end
     agent.settings.strict_mcp_config && push!(arguments, "--strict-mcp-config")
-    append!(arguments, ["--mcp-config", JSON.json(Dict("mcpServers" => servers))])
+    append!(arguments, ["--mcp-config", mcp_config_path])
     arguments
+end
+
+"""
+    make_mcp_config(agent, session) -> Dict
+
+The MCP configuration of the `claude` of a session: the MCP servers of the
+editor, and the permission server with the secret of the session.
+"""
+function make_mcp_config(agent::ClaudeCodeAgent, session::ClaudeSession)
+    servers = Dict{String,Any}()
+    for server in session.mcp_servers
+        config = _make_mcp_server_config(server)
+        config === nothing || (servers[first(config)] = last(config))
+    end
+    servers[PERMISSION_SERVER_NAME] = make_permission_mcp_server(_get_or_start_permission_server!(agent),
+                                                                 session.secret)
+    Dict{String,Any}("mcpServers" => servers)
+end
+
+# The MCP configuration in the private folder of the session, which only this
+# user can read. Answers its path.
+function _write_mcp_config!(agent::ClaudeCodeAgent, session::ClaudeSession)
+    path = joinpath(session.config_folder, "mcp.json")
+    open(path, "w") do file
+        chmod(path, 0o600)
+        JSON.json(file, make_mcp_config(agent, session))
+    end
+    path
 end
 
 # The entry of an MCP server of the editor in the configuration of `claude`, as
@@ -146,12 +174,12 @@ function _make_mcp_server_config(server)
     nothing
 end
 
-function _get_permission_server!(agent::ClaudeCodeAgent)
+function _get_or_start_permission_server!(agent::ClaudeCodeAgent)
     lock(agent.lock) do
         agent.permission === nothing &&
-            (agent.permission = start_permission_server(secret -> _find_session_by_secret(agent, secret),
+            (agent.permission = start_permission_server!(secret -> _find_session_by_secret(agent, secret),
                 (session, tool_name, input, tool_use_id) ->
-                    decide_permission(agent, session, tool_name, input, tool_use_id)))
+                    decide_permission!(agent, session, tool_name, input, tool_use_id)))
         agent.permission
     end
 end
@@ -168,16 +196,16 @@ end
 # --- The sign-in -------------------------------------------------------------
 
 """
-    check_claude_sign_in(claude_command) -> Union{Bool,Nothing}
+    read_claude_sign_in(claude_command) -> Union{Bool,Nothing}
 
 Whether `claude` is signed in, from `claude auth status --json`. Reads only its
 field `loggedIn`; the rest of the status, such as the email of the account, is
 neither kept nor logged. Answers `nothing` when the status does not come.
 """
-function check_claude_sign_in(claude_command::Vector{String})
+function read_claude_sign_in(claude_command::Vector{String})
     output = IOBuffer()
-    environment = Dict{String,String}(filter(pair -> !(first(pair) in PARENT_SESSION_VARIABLES), ENV))
-    command = Cmd(Cmd([claude_command..., "auth", "status", "--json"]); env = environment, ignorestatus = true)
+    command = Cmd(Cmd([claude_command..., "auth", "status", "--json"]); env = make_claude_environment(),
+                  ignorestatus = true)
     process = try
         run(pipeline(command; stdout = output, stderr = devnull); wait = false)
     catch exception
@@ -188,6 +216,8 @@ function check_claude_sign_in(claude_command::Vector{String})
         kill(process)
         return nothing
     end
+    # The wait also ends the copy of the output into the buffer.
+    wait(process)
     status = try
         JSON.parse(String(take!(output)))
     catch exception
@@ -198,8 +228,8 @@ function check_claude_sign_in(claude_command::Vector{String})
     signed_in isa Bool ? signed_in : nothing
 end
 
-function _check_sign_in(agent::ClaudeCodeAgent)
-    agent.settings.check_sign_in(agent.settings.claude_command) === false &&
+function _require_sign_in(agent::ClaudeCodeAgent)
+    agent.settings.read_sign_in(agent.settings.claude_command) === false &&
         throw(ACP.ProtocolException(ACP.AUTHENTICATION_REQUIRED,
                                     "Claude Code is not signed in. Run `claude auth login` in a terminal."))
     nothing
@@ -228,14 +258,14 @@ ACP.answer_request(agent::ClaudeCodeAgent, request::ACP.AuthenticateRequest, con
 
 function ACP.answer_request(agent::ClaudeCodeAgent, request::ACP.NewSessionRequest, context)
     agent.connection = context.connection
-    _check_sign_in(agent)
+    _require_sign_in(agent)
     session = _open_session!(agent, string(uuid4()), request.cwd, request.mcp_servers; has_history = false)
     ACP.NewSessionResponse(session_id = session.id, config_options = make_config_options(session))
 end
 
 function ACP.answer_request(agent::ClaudeCodeAgent, request::ACP.ResumeSessionRequest, context)
     agent.connection = context.connection
-    _check_sign_in(agent)
+    _require_sign_in(agent)
     session = _open_session!(agent, request.session_id, request.cwd, something(request.mcp_servers, Any[]);
                              has_history = true)
     ACP.ResumeSessionResponse(config_options = make_config_options(session))
@@ -243,35 +273,53 @@ end
 
 function _open_session!(agent::ClaudeCodeAgent, id::String, directory::String, mcp_servers;
                         has_history::Bool)
-    isabspath(directory) || throw(ACP.ProtocolException(ACP.INVALID_PARAMS, "The folder `$(directory)` is no absolute path."))
-    session = ClaudeSession(id, directory, collect(Any, mcp_servers), make_session_secret(),
+    isabspath(directory) && isdir(directory) ||
+        throw(ACP.ProtocolException(ACP.INVALID_PARAMS, "The folder `$(directory)` is no absolute path of a folder."))
+    session = ClaudeSession(id, directory, collect(Any, mcp_servers), make_session_secret(), mktempdir(),
                             Dict(option.id => "default" for option in SESSION_OPTIONS), Set{String}(),
-                            nothing, has_history, false, nothing, String[], Set{String}(), TurnState(),
-                            false, false, ACP.OutgoingRequest[], ReentrantLock())
-    lock(agent.lock) do
-        haskey(agent.sessions, id) && throw(ACP.ProtocolException(ACP.INVALID_PARAMS, "The session `$(id)` is open."))
-        agent.sessions[id] = session
+                            nothing, String[], has_history, false, nothing, String[], Set{String}(), TurnState(),
+                            false, false, false, ACP.OutgoingRequest[], ReentrantLock())
+    is_open = lock(agent.lock) do
+        haskey(agent.sessions, id) || (agent.sessions[id] = session; return false)
+        true
+    end
+    if is_open
+        rm(session.config_folder; recursive = true, force = true)
+        throw(ACP.ProtocolException(ACP.INVALID_PARAMS, "The session `$(id)` is open."))
     end
     try
         _start_claude!(agent, session)
     catch
         lock(() -> delete!(agent.sessions, id), agent.lock)
+        rm(session.config_folder; recursive = true, force = true)
         rethrow()
     end
     session
 end
 
+# Start the `claude` of a session, in place of the one before. A session that
+# closed meanwhile keeps no process: the new one ends at once. Answers whether
+# the session has the new process.
 function _start_claude!(agent::ClaudeCodeAgent, session::ClaudeSession)
-    arguments = make_claude_arguments(agent, session)
-    session.process = try
-        agent.settings.start_claude(arguments, session.directory)
+    previous = session.process
+    previous === nothing || isempty(previous.capabilities) || (session.capabilities = copy(previous.capabilities))
+    arguments = make_claude_arguments(agent, session, _write_mcp_config!(agent, session))
+    process = try
+        agent.settings.start_claude(arguments, session.directory; capabilities = session.capabilities)
     catch exception
         exception isa Base.IOError || rethrow()
+        # The message of the exception quotes the command line, so the answer
+        # names only the error of the system.
+        reason = exception.code < 0 ? Libc.strerror(-exception.code) : "error $(exception.code)"
         throw(ACP.ProtocolException(ACP.INTERNAL_ERROR, "The program `$(first(agent.settings.claude_command))` " *
-                                    "can not start: $(sprint(showerror, exception)). Install Claude Code."))
+                                    "can not start: $(reason). Install Claude Code, or give its path."))
     end
-    session.needs_restart = false
-    nothing
+    is_closed = lock(session.lock) do
+        session.is_closed || (session.process = process; session.needs_restart = false)
+        session.is_closed
+    end
+    is_closed && close_claude_process!(process)
+    !is_closed
 end
 
 function _get_session(agent::ClaudeCodeAgent, id::AbstractString)
@@ -304,11 +352,19 @@ function ACP.answer_request(agent::ClaudeCodeAgent, request::ACP.CloseSessionReq
     ACP.CloseSessionResponse()
 end
 
+# A close works as a cancel of the prompt that runs, and then ends `claude`.
 function _close_session!(session::ClaudeSession)
-    requests = lock(() -> copy(session.waiting_permissions), session.lock)
+    process, requests = lock(session.lock) do
+        session.is_closed = true
+        session.is_prompting && (session.is_cancelled = true)
+        session.process, copy(session.waiting_permissions)
+    end
     foreach(_cancel_quietly!, requests)
-    process = session.process
-    process === nothing || close_claude_process!(process)
+    if process !== nothing
+        interrupt_claude!(process)
+        close_claude_process!(process)
+    end
+    rm(session.config_folder; recursive = true, force = true)
     nothing
 end
 
@@ -323,7 +379,8 @@ end
 """
     close_agent!(agent)
 
-End each session of the agent and its `claude`, and stop the permission server.
+End each session of the agent and its `claude`, all at once, and stop the
+permission server.
 """
 function close_agent!(agent::ClaudeCodeAgent)
     sessions = lock(agent.lock) do
@@ -331,7 +388,9 @@ function close_agent!(agent::ClaudeCodeAgent)
         empty!(agent.sessions)
         sessions
     end
-    foreach(_close_session!, sessions)
+    @sync for session in sessions
+        @async _close_session!(session)
+    end
     permission = lock(() -> (permission = agent.permission; agent.permission = nothing; permission), agent.lock)
     permission === nothing || stop_permission_server!(permission)
     nothing
@@ -342,6 +401,7 @@ end
 function ACP.answer_request(agent::ClaudeCodeAgent, request::ACP.PromptRequest, context)
     session = _get_session(agent, request.session_id)
     lock(session.lock) do
+        session.is_closed && throw(ACP.ProtocolException(ACP.INVALID_PARAMS, "The session is closed."))
         session.is_prompting && throw(ACP.ProtocolException(ACP.INVALID_REQUEST, "A prompt runs in this session."))
         session.is_prompting = true
         session.is_cancelled = false
@@ -354,6 +414,9 @@ function ACP.answer_request(agent::ClaudeCodeAgent, request::ACP.PromptRequest, 
             process === nothing || close_claude_process!(process)
             _start_claude!(agent, session)
         end
+        # A cancel or a close that came during the start ends the prompt here,
+        # before `claude` gets the message.
+        lock(() -> session.is_cancelled, session.lock) && return ACP.PromptResponse(stop_reason = "cancelled")
         if session.title === nothing
             session.title = make_title(request.prompt)
             session.title === nothing ||
@@ -362,8 +425,15 @@ function ACP.answer_request(agent::ClaudeCodeAgent, request::ACP.PromptRequest, 
         send_user_message!(session.process, content)
         session.has_history = true
         ACP.PromptResponse(stop_reason = _follow_turn!(session, connection))
+    catch
+        # The events of a turn that failed must not reach the next prompt.
+        session.needs_restart = true
+        rethrow()
     finally
-        lock(() -> (session.is_prompting = false), session.lock)
+        lock(session.lock) do
+            session.is_prompting = false
+            empty!(session.state.tool_calls)
+        end
     end
 end
 
@@ -376,7 +446,7 @@ function _follow_turn!(session::ClaudeSession, connection::ACP.Connection)
         type = get(event, "type", nothing)
         if type == "process_exit"
             session.needs_restart = true
-            session.is_cancelled && return "cancelled"
+            lock(() -> session.is_cancelled, session.lock) && return "cancelled"
             throw(ACP.ProtocolException(ACP.INTERNAL_ERROR, "Claude Code ended before the end of the turn."))
         elseif type == "system" && get(event, "subtype", nothing) == "init"
             _read_init!(session, event, connection)
@@ -416,8 +486,8 @@ function _read_init!(session::ClaudeSession, event::Dict{String,Any}, connection
 end
 
 # How much of its context the session uses: the context of the last request,
-# out of the context window of the model, with the cost of the session that
-# `claude` estimates.
+# out of the context window of the model, and the cost that `claude` estimates
+# for the whole conversation, also across a `--resume`.
 function _send_usage!(session::ClaudeSession, result::Dict{String,Any}, connection::ACP.Connection)
     size = 0
     model_usage = get(result, "modelUsage", nothing)
@@ -437,7 +507,7 @@ end
 # The stop reason of a `result`, or an error answer for a turn that failed, with
 # the message of `claude`, such as a sign-in that is missing.
 function _read_stop_reason(session::ClaudeSession, result::Dict{String,Any})
-    session.is_cancelled && return "cancelled"
+    lock(() -> session.is_cancelled, session.lock) && return "cancelled"
     subtype = get(result, "subtype", "")
     terminal = get(result, "terminal_reason", nothing)
     terminal in ("aborted_streaming", "aborted_tools", "interrupted") && return "cancelled"
@@ -457,8 +527,8 @@ end
 """
     make_title(prompt) -> Union{String,Nothing}
 
-The title of a session from its first prompt: the first line of its text, with
-at most 80 characters.
+The title of a session from a prompt: the first line of its text, with at most
+80 characters.
 """
 function make_title(prompt::AbstractVector)
     for block in prompt
@@ -481,9 +551,8 @@ function _make_claude_content(prompt::AbstractVector)
         if block isa ACP.TextContent
             push!(content, Dict{String,Any}("type" => "text", "text" => block.text))
         elseif block isa ACP.ResourceLink
-            uri = block.uri
-            push!(content, Dict{String,Any}("type" => "text",
-                                            "text" => startswith(uri, "file://") ? "@" * uri[8:end] : uri))
+            path = _find_file_path(block.uri)
+            push!(content, Dict{String,Any}("type" => "text", "text" => path === nothing ? block.uri : "@" * path))
         elseif block isa ACP.EmbeddedResource && block.resource isa ACP.TextResourceContents
             resource = block.resource
             push!(content, Dict{String,Any}("type" => "text", "text" =>
@@ -496,19 +565,26 @@ function _make_claude_content(prompt::AbstractVector)
     content
 end
 
+# The path of a `file:` URI, decoded, or `nothing` for another URI.
+function _find_file_path(uri::AbstractString)
+    for prefix in ("file://localhost/", "file:///")
+        startswith(uri, prefix) && return "/" * HTTP.URIs.unescapeuri(uri[length(prefix) + 1:end])
+    end
+    nothing
+end
+
 # --- A cancel ----------------------------------------------------------------
 
 function ACP.receive_notification(agent::ClaudeCodeAgent, notification::ACP.CancelNotification, connection)
     session = lock(() -> get(agent.sessions, notification.session_id, nothing), agent.lock)
     session === nothing && return nothing
-    requests = lock(session.lock) do
-        session.is_prompting || return nothing
+    process, requests = lock(session.lock) do
+        session.is_prompting || return (nothing, nothing)
         session.is_cancelled = true
-        copy(session.waiting_permissions)
+        session.process, copy(session.waiting_permissions)
     end
     requests === nothing && return nothing
     foreach(_cancel_quietly!, requests)
-    process = session.process
     process === nothing || interrupt_claude!(process)
     nothing
 end
@@ -516,19 +592,24 @@ end
 # --- A question for the person -----------------------------------------------
 
 """
-    decide_permission(agent, session, tool_name, input, tool_use_id) -> Dict
+    decide_permission!(agent, session, tool_name, input, tool_use_id) -> Dict
 
 The decision on a call of a tool, as the permission tool answers it: the
 person decides through `session/request_permission`. A tool that the person
-allowed always in the session runs without a question. A call outside a prompt,
-and a question without an answer, are denied.
+allowed always in the session runs without a question. A call outside a
+prompt, a call after a cancel, and a question without an answer are denied.
 """
-function decide_permission(agent::ClaudeCodeAgent, session::ClaudeSession, tool_name::String,
-                           input::Dict{String,Any}, tool_use_id::String)
-    lock(() -> tool_name in session.always_allowed, session.lock) && return _allow(input)
+function decide_permission!(agent::ClaudeCodeAgent, session::ClaudeSession, tool_name::String,
+                            input::Dict{String,Any}, tool_use_id::String)
+    state = lock(session.lock) do
+        (session.is_cancelled || !session.is_prompting) ? :refused :
+        tool_name in session.always_allowed ? :allowed : :asked
+    end
+    state === :allowed && return _make_allow_decision(input)
+    state === :refused &&
+        return _make_deny_decision("No prompt runs in this session, so nobody can allow this call.")
     connection = agent.connection
-    (connection === nothing || !lock(() -> session.is_prompting, session.lock)) &&
-        return _deny("No prompt runs in this session, so nobody can allow this call.")
+    connection === nothing && return _make_deny_decision("No editor is connected, so nobody can allow this call.")
     tool_call = ACP.ToolCallUpdate(tool_call_id = tool_use_id, title = format_tool_title(tool_name, input),
                                    name = tool_name, kind = get_tool_kind(tool_name), status = "pending",
                                    raw_input = input)
@@ -536,24 +617,35 @@ function decide_permission(agent::ClaudeCodeAgent, session::ClaudeSession, tool_
         ACP.PermissionOption(option_id = "allow_always", name = "Always allow $(tool_name)", kind = "allow_always"),
         ACP.PermissionOption(option_id = "allow", name = "Allow", kind = "allow_once"),
         ACP.PermissionOption(option_id = "reject", name = "Reject", kind = "reject_once")]
-    request = ACP.start_request!(connection, ACP.RequestPermissionRequest(
-        session_id = session.id, tool_call = tool_call, options = options))
-    lock(() -> push!(session.waiting_permissions, request), session.lock)
+    request = try
+        ACP.start_request!(connection, ACP.RequestPermissionRequest(
+            session_id = session.id, tool_call = tool_call, options = options))
+    catch exception
+        exception isa ACP.ProtocolException || exception isa Base.IOError || rethrow()
+        return _make_deny_decision("No answer can come from the editor.")
+    end
+    # A cancel that came while the question started withdraws it at once.
+    is_cancelled = lock(session.lock) do
+        push!(session.waiting_permissions, request)
+        session.is_cancelled
+    end
+    is_cancelled && _cancel_quietly!(request)
     outcome = try
         ACP.wait_for_answer(request).outcome
     catch exception
         exception isa ACP.ProtocolException || rethrow()
-        nothing
+        :no_answer
     finally
         lock(() -> filter!(waiting -> waiting !== request, session.waiting_permissions), session.lock)
     end
+    outcome === :no_answer && return _make_deny_decision("No answer came from the editor.")
     if outcome isa ACP.SelectedPermissionOutcome
         outcome.option_id == "allow_always" && lock(() -> push!(session.always_allowed, tool_name), session.lock)
-        outcome.option_id in ("allow", "allow_always") && return _allow(input)
-        return _deny("The person rejected this call.")
+        outcome.option_id in ("allow", "allow_always") && return _make_allow_decision(input)
+        return _make_deny_decision("The person rejected this call.")
     end
-    _deny("The person gave no answer, because the prompt was cancelled.")
+    _make_deny_decision("The prompt was cancelled.")
 end
 
-_allow(input::Dict{String,Any}) = Dict{String,Any}("behavior" => "allow", "updatedInput" => input)
-_deny(message::String) = Dict{String,Any}("behavior" => "deny", "message" => message)
+_make_allow_decision(input::Dict{String,Any}) = Dict{String,Any}("behavior" => "allow", "updatedInput" => input)
+_make_deny_decision(message::String) = Dict{String,Any}("behavior" => "deny", "message" => message)
