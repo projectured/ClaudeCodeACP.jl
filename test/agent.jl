@@ -116,6 +116,24 @@ collect_text(updates, type) = join(update.content.text for update in updates if 
         close_test_agent(strict)
     end
 
+    @testset "the editor adds to the system prompt through the _meta of a session" begin
+        fakes = FakeClaude[]
+        test = open_test_agent(make_test_settings([]; fakes))
+        meta = Dict("claudeCode" => Dict("options" => Dict("systemPrompt" => Dict(
+            "type" => "preset", "preset" => "claude_code", "append" => "You run inside the editor."))))
+        ACP.send_request!(test.connection, ACP.NewSessionRequest(cwd = TEST_FOLDER, mcp_servers = [], meta = meta);
+                          timeout = 10)
+        arguments = last(fakes).arguments
+        path = arguments[findfirst(==("--append-system-prompt-file"), arguments) + 1]
+        @test read(path, String) == "You run inside the editor."
+        @test dirname(path) == dirname(read_mcp_config_path(last(fakes)))
+        open_test_session(test)
+        @test !("--append-system-prompt-file" in last(fakes).arguments)
+        @test ClaudeCodeACP.read_system_prompt_addition(nothing) == ""
+        @test ClaudeCodeACP.read_system_prompt_addition(Dict("claudeCode" => Dict("options" => 1))) == ""
+        close_test_agent(test)
+    end
+
     @testset "a prompt streams its title, commands, thinking, text and usage" begin
         fakes = FakeClaude[]
         test = open_test_agent(make_test_settings([read_recorded("thinking-and-text.jsonl")]; fakes))

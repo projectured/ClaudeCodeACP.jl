@@ -1,6 +1,6 @@
 name = "ClaudeCodeACP"
 uuid = "397ce549-bc36-418a-97e7-6295a63dbdc4"
-version = "0.1.1"
+version = "0.1.2"
 authors = []
 
 [deps]

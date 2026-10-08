@@ -28,14 +28,15 @@ end
     ClaudeSession
 
 One session of the agent: its id, which is also the session id of `claude`, its
-folder, the MCP servers of the editor, the secret of its permission tool and
-the private folder of its MCP configuration, its options, its `claude` process,
-and the state of its turns.
+folder, the MCP servers of the editor, the text that the editor adds to the
+system prompt, the secret of its permission tool and the private folder of its
+configuration, its options, its `claude` process, and the state of its turns.
 """
 mutable struct ClaudeSession
     id::String
     directory::String
     mcp_servers::Vector{Any}
+    system_prompt::String
     secret::String
     config_folder::String
     options::Dict{String,String}
@@ -113,11 +114,13 @@ make_config_options(session::ClaudeSession) = ACP.SessionConfigOption[
 The command line of the `claude` of a session: print mode with stream-json in
 and out, the stream of partial messages, the text of the thinking with the
 setting `showThinkingSummaries` and, when `claude` takes it, the flag
-`--thinking-display summarized`, the permission tool, the session id or the session to resume, the options that the
-person chose, and the file of the MCP configuration, which holds the secrets
-and so is not on the command line.
+`--thinking-display summarized`, the permission tool, the session id or the
+session to resume, the options that the person chose, the file of the addition
+to the system prompt when the editor gave one, and the file of the MCP
+configuration, which holds the secrets and so is not on the command line.
 """
-function make_claude_arguments(agent::ClaudeCodeAgent, session::ClaudeSession, mcp_config_path::String)
+function make_claude_arguments(agent::ClaudeCodeAgent, session::ClaudeSession, mcp_config_path::String;
+                               system_prompt_path::Union{Nothing,String} = nothing)
     arguments = String[agent.settings.claude_command..., "-p",
                        "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
                        "--include-partial-messages",
@@ -132,6 +135,7 @@ function make_claude_arguments(agent::ClaudeCodeAgent, session::ClaudeSession, m
         append!(arguments, [option.flag, option.id == "mode" && value == "default" ? DEFAULT_MODE_FLAG_VALUE : value])
     end
     agent.settings.strict_mcp_config && push!(arguments, "--strict-mcp-config")
+    system_prompt_path === nothing || append!(arguments, ["--append-system-prompt-file", system_prompt_path])
     append!(arguments, ["--mcp-config", mcp_config_path])
     arguments
 end
@@ -162,6 +166,32 @@ function _write_mcp_config!(agent::ClaudeCodeAgent, session::ClaudeSession)
         JSON.json(file, make_mcp_config(agent, session))
     end
     path
+end
+
+# The addition to the system prompt in the private folder of the session, or
+# `nothing` when the editor gave none. Answers its path.
+function _write_system_prompt!(session::ClaudeSession)
+    isempty(session.system_prompt) && return nothing
+    path = joinpath(session.config_folder, "system-prompt.md")
+    write(path, session.system_prompt)
+    path
+end
+
+"""
+    read_system_prompt_addition(meta) -> String
+
+The text that an editor adds to the system prompt of a session, from the `_meta`
+of `session/new` or `session/resume`: `claudeCode.options.systemPrompt.append`,
+where the Claude agents of ACP read it. Empty when the `_meta` has none.
+"""
+function read_system_prompt_addition(meta)
+    for key in ("claudeCode", "options", "systemPrompt")
+        meta isa AbstractDict || return ""
+        meta = get(meta, key, nothing)
+    end
+    meta isa AbstractDict || return ""
+    addition = get(meta, "append", nothing)
+    addition isa AbstractString ? String(addition) : ""
 end
 
 # The entry of an MCP server of the editor in the configuration of `claude`, as
@@ -300,7 +330,8 @@ ACP.answer_request(agent::ClaudeCodeAgent, request::ACP.AuthenticateRequest, con
 function ACP.answer_request(agent::ClaudeCodeAgent, request::ACP.NewSessionRequest, context)
     agent.connection = context.connection
     _require_sign_in(agent)
-    session = _open_session!(agent, string(uuid4()), request.cwd, request.mcp_servers; has_history = false)
+    session = _open_session!(agent, string(uuid4()), request.cwd, request.mcp_servers; has_history = false,
+                             system_prompt = read_system_prompt_addition(request.meta))
     ACP.NewSessionResponse(session_id = session.id, config_options = make_config_options(session))
 end
 
@@ -308,15 +339,15 @@ function ACP.answer_request(agent::ClaudeCodeAgent, request::ACP.ResumeSessionRe
     agent.connection = context.connection
     _require_sign_in(agent)
     session = _open_session!(agent, request.session_id, request.cwd, something(request.mcp_servers, Any[]);
-                             has_history = true)
+                             has_history = true, system_prompt = read_system_prompt_addition(request.meta))
     ACP.ResumeSessionResponse(config_options = make_config_options(session))
 end
 
 function _open_session!(agent::ClaudeCodeAgent, id::String, directory::String, mcp_servers;
-                        has_history::Bool)
+                        has_history::Bool, system_prompt::String = "")
     isabspath(directory) && isdir(directory) ||
         throw(ACP.ProtocolException(ACP.INVALID_PARAMS, "The folder `$(directory)` is no absolute path of a folder."))
-    session = ClaudeSession(id, directory, collect(Any, mcp_servers), make_session_secret(), mktempdir(),
+    session = ClaudeSession(id, directory, collect(Any, mcp_servers), system_prompt, make_session_secret(), mktempdir(),
                             Dict(option.id => "default" for option in SESSION_OPTIONS), Set{String}(),
                             nothing, String[], has_history, false, nothing, String[], Set{String}(), TurnState(),
                             false, false, false, ACP.OutgoingRequest[], ReentrantLock())
@@ -344,7 +375,8 @@ end
 function _start_claude!(agent::ClaudeCodeAgent, session::ClaudeSession)
     previous = session.process
     previous === nothing || isempty(previous.capabilities) || (session.capabilities = copy(previous.capabilities))
-    arguments = make_claude_arguments(agent, session, _write_mcp_config!(agent, session))
+    arguments = make_claude_arguments(agent, session, _write_mcp_config!(agent, session);
+                                      system_prompt_path = _write_system_prompt!(session))
     process = try
         agent.settings.start_claude(arguments, session.directory; capabilities = session.capabilities)
     catch exception

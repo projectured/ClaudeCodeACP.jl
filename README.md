@@ -106,6 +106,10 @@ editor ──ACP──▶ claude-code-acp ──stream-json──▶ claude -p  
   random bearer secret for it.
 - A cancel sends the interrupt message of the stream when Claude Code offers
   it, and `SIGINT` else.
+- An editor can add text to the system prompt of a session, such as what the
+  editor is and how to use its tools, in the `_meta` of `session/new` as
+  `claudeCode.options.systemPrompt.append`, the key that the Claude agents of
+  ACP read. The agent passes it with `--append-system-prompt-file`.
 
 ## Licence
 
