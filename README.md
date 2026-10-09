@@ -106,6 +106,10 @@ editor ──ACP──▶ claude-code-acp ──stream-json──▶ claude -p  
   random bearer secret for it.
 - A cancel sends the interrupt message of the stream when Claude Code offers
   it, and `SIGINT` else.
+- A `Read` of a text file goes to the editor as a resource: the text as it is in
+  the file, without the numbers of its lines, its `file://` uri, and the media
+  type of its extension, so an editor can show a Markdown file or Julia code as
+  more than text.
 - An editor can add text to the system prompt of a session, such as what the
   editor is and how to use its tools, in the `_meta` of `session/new` as
   `claudeCode.options.systemPrompt.append`, the key that the Claude agents of

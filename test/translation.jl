@@ -36,6 +36,21 @@ tool_result(content; id = "t1", is_error = false, result = nothing) = Dict{Strin
         text = only(translate_event!(state, tool_result(Any[Dict{String,Any}("type" => "text", "text" => "line")];
                                                         id = "t2")))
         @test only(text.content).content.text == "line"
+        # A read of a file gives its text as a resource, without the numbers of
+        # its lines, and with the media type of its extension.
+        translate_event!(state, tool_use("Read", Dict{String,Any}("file_path" => "/c.md"); id = "t3"))
+        read_file = Dict{String,Any}("type" => "text", "file" => Dict{String,Any}(
+            "filePath" => "/c.md", "content" => "# Title\n", "numLines" => 2, "startLine" => 1, "totalLines" => 2))
+        update = only(translate_event!(state, tool_result("1\t# Title\n2\t"; id = "t3", result = read_file)))
+        resource = only(update.content).content.resource
+        @test (resource.uri, resource.mime_type, resource.text) == ("file:///c.md", "text/markdown", "# Title\n")
+        @test ClaudeCodeACP.find_media_type("/d/E.JL") == "text/x-julia"
+        @test ClaudeCodeACP.find_media_type("/d/e.unknown") === nothing
+        # A read with no text of a file keeps the text for the model.
+        translate_event!(state, tool_use("Read", Dict{String,Any}("file_path" => "/f.png"); id = "t4"))
+        image = only(translate_event!(state, tool_result("[image]"; id = "t4",
+                                                         result = Dict{String,Any}("type" => "image"))))
+        @test only(image.content).content.text == "[image]"
     end
 
     @testset "a deleted task leaves the plan" begin

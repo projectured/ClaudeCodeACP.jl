@@ -111,6 +111,8 @@ function _make_tool_result!(state::TurnState, block::Dict{String,Any}, tool_use_
                                 new_text = string(get(input, "new_string", ""))))
     elseif !is_error && name == "Write" && haskey(input, "file_path")
         push!(content, ACP.Diff(path = string(input["file_path"]), new_text = string(get(input, "content", ""))))
+    elseif !is_error && name == "Read" && (resource = make_read_resource(tool_use_result)) !== nothing
+        push!(content, ACP.Content(content = ACP.EmbeddedResource(resource = resource)))
     else
         text = _format_result_text(get(block, "content", nothing))
         isempty(text) || push!(content, ACP.Content(content = ACP.TextContent(text = text)))
@@ -120,6 +122,41 @@ function _make_tool_result!(state::TurnState, block::Dict{String,Any}, tool_use_
     is_error || _update_tasks!(state, name, input, tool_use_result) && push!(updates, make_plan(state))
     updates
 end
+
+"""
+    make_read_resource(tool_use_result) -> Union{ACP.TextResourceContents,Nothing}
+
+The text of a file that the tool `Read` gave, as a resource of ACP: the text as
+it is in the file, the `file://` uri of its path, and the media type that the
+extension of the path names. Claude Code reports the read in `tool_use_result`
+without the numbers that the text for the model has on each line. `nothing` for
+a read of another kind, such as an image, which keeps its text.
+"""
+function make_read_resource(tool_use_result)
+    tool_use_result isa AbstractDict && get(tool_use_result, "type", nothing) == "text" || return nothing
+    file = get(tool_use_result, "file", nothing)
+    file isa AbstractDict || return nothing
+    path = get(file, "filePath", nothing)
+    text = get(file, "content", nothing)
+    (path isa AbstractString && text isa AbstractString) || return nothing
+    ACP.TextResourceContents(uri = "file://" * path, mime_type = find_media_type(path), text = text)
+end
+
+# The media types of the extensions of the files that an editor can show as more
+# than text.
+const MEDIA_TYPES = Dict(
+    ".md" => "text/markdown", ".markdown" => "text/markdown", ".jl" => "text/x-julia",
+    ".json" => "application/json", ".xml" => "application/xml", ".yaml" => "application/yaml",
+    ".yml" => "application/yaml", ".toml" => "application/toml", ".csv" => "text/csv",
+    ".html" => "text/html", ".py" => "text/x-python", ".txt" => "text/plain")
+
+"""
+    find_media_type(path) -> Union{String,Nothing}
+
+The media type that the extension of `path` names, or `nothing` for an extension
+that `MEDIA_TYPES` does not hold.
+"""
+find_media_type(path::AbstractString) = get(MEDIA_TYPES, lowercase(last(splitext(path))), nothing)
 
 function _format_result_text(content)
     content isa AbstractString && return String(content)
