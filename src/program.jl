@@ -62,9 +62,7 @@ function main(arguments::AbstractVector{<:AbstractString})
     0
 end
 
-function _run_login(claude::String)
-    process = run(ignorestatus(`$claude auth login`))
-    process.exitcode
-end
+_run_login(claude::String) =
+    run(ignorestatus(make_login_command(AgentSettings(claude_command = [claude])))).exitcode
 
 (@main)(arguments) = main(arguments)

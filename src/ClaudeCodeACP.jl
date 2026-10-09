@@ -22,7 +22,7 @@ using Sockets
 using UUIDs: uuid4
 using Random: RandomDevice
 
-export ClaudeCodeAgent, AgentSettings, serve_agent, close_agent!
+export ClaudeCodeAgent, AgentSettings, serve_agent, close_agent!, make_login_command
 
 include("process.jl")
 include("translation.jl")

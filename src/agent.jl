@@ -268,6 +268,18 @@ function read_claude_sign_in(claude_command::Vector{String})
 end
 
 """
+    make_login_command(settings = AgentSettings()) -> Cmd
+
+The command of the sign-in of the agent: `claude auth login`, with the `claude`
+command of `settings`, in the environment that the agent gives `claude`. A
+person answers it in a terminal, and it ends with the status 0 when the sign-in
+worked. `claude-code-acp --login` runs it, and an editor that runs the agent in
+its own process runs it for the method `claude-login`.
+"""
+make_login_command(settings::AgentSettings = AgentSettings()) =
+    Cmd(Cmd([settings.claude_command..., "auth", "login"]); env = make_claude_environment())
+
+"""
     run_claude_sign_out(claude_command) -> Nothing
 
 Sign `claude` out with `claude auth logout`. Throws a `ProtocolException` when

@@ -39,6 +39,13 @@ end
         @test ClaudeCodeACP.read_claude_sign_in(["claude-code-acp-no-such-program"]) === nothing
     end
 
+    @testset "the sign-in command is claude auth login without the variables of a parent session" begin
+        command = make_login_command(AgentSettings(claude_command = ["claude-x", "--flag"]))
+        @test command.exec == ["claude-x", "--flag", "auth", "login"]
+        @test !any(entry -> startswith(entry, "CLAUDECODE="), command.env)
+        @test make_login_command().exec == ["claude", "auth", "login"]
+    end
+
     @testset "the sign-out runs claude auth logout and needs its status 0" begin
         # The fake ends with 0 only when it gets the arguments `auth logout`.
         logout = ["sh", "-c", "test \"\$1 \$2\" = 'auth logout'", "claude"]
