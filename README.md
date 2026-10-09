@@ -25,7 +25,10 @@ in the editor stops the turn. The mode, the model and the effort are options of
 the session.
 
 The agent needs no Node.js and no API key. It uses the sign-in of Claude Code
-and reads no credential.
+and reads no credential. To an editor that can run a sign-in in a terminal, it
+names the sign-in `claude-login`, which runs `claude-code-acp --login`. The ACP
+request `logout` runs `claude auth logout`, and the next prompt of each session
+then asks for a sign-in.
 
 ## Install
 

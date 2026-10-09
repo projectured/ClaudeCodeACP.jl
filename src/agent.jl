@@ -2,7 +2,7 @@
 # with its own `claude` process.
 
 """
-    AgentSettings(; claude_command, strict_mcp_config, start_claude, read_sign_in)
+    AgentSettings(; claude_command, strict_mcp_config, start_claude, read_sign_in, run_sign_out)
 
 - `claude_command`    — the program `claude` and its first arguments.
 - `strict_mcp_config` — give `claude` only the MCP servers of the editor and the
@@ -12,6 +12,8 @@
   answers its `ClaudeProcess`; a test gives a fake.
 - `read_sign_in(claude_command)` — answers whether `claude` is signed in, or
   `nothing` when it can not tell.
+- `run_sign_out(claude_command)` — signs `claude` out, and throws when it can
+  not; a test gives a fake.
 - `read_thinking_display(claude_command)` — answers whether `claude` takes the
   flag `--thinking-display`.
 """
@@ -21,6 +23,7 @@ Base.@kwdef struct AgentSettings
     start_claude::Function = (arguments, directory; capabilities = String[]) ->
         open_claude_process(Cmd(Cmd(arguments); dir = directory); capabilities)
     read_sign_in::Function = read_claude_sign_in
+    run_sign_out::Function = run_claude_sign_out
     read_thinking_display::Function = read_claude_thinking_display
 end
 
@@ -265,6 +268,31 @@ function read_claude_sign_in(claude_command::Vector{String})
 end
 
 """
+    run_claude_sign_out(claude_command) -> Nothing
+
+Sign `claude` out with `claude auth logout`. Throws a `ProtocolException` when
+the command does not start, does not end in 20 seconds, or fails. The message
+names only the exit status, not what `claude` wrote.
+"""
+function run_claude_sign_out(claude_command::Vector{String})
+    command = Cmd(Cmd([claude_command..., "auth", "logout"]); env = make_claude_environment(),
+                  ignorestatus = true)
+    process = try
+        run(pipeline(command; stdout = devnull, stderr = devnull); wait = false)
+    catch exception
+        exception isa Base.IOError || rethrow()
+        throw(ACP.ProtocolException(ACP.INTERNAL_ERROR, "The program `$(first(claude_command))` can not start."))
+    end
+    if timedwait(() -> process_exited(process), 20.0) !== :ok
+        kill(process)
+        throw(ACP.ProtocolException(ACP.INTERNAL_ERROR, "`claude auth logout` did not end in 20 seconds."))
+    end
+    process.exitcode == 0 ||
+        throw(ACP.ProtocolException(ACP.INTERNAL_ERROR, "`claude auth logout` failed with the status $(process.exitcode)."))
+    nothing
+end
+
+"""
     read_claude_thinking_display(claude_command) -> Bool
 
 Whether `claude` takes the flag `--thinking-display`, which a recent model
@@ -317,12 +345,31 @@ function ACP.answer_request(agent::ClaudeCodeAgent, request::ACP.InitializeReque
             prompt_capabilities = ACP.PromptCapabilities(image = false, audio = false, embedded_context = true),
             mcp_capabilities = ACP.McpCapabilities(http = true, sse = true),
             session_capabilities = ACP.SessionCapabilities(close = ACP.SessionCloseCapabilities(),
-                                                           resume = ACP.SessionResumeCapabilities())),
+                                                           resume = ACP.SessionResumeCapabilities()),
+            auth = ACP.AgentAuthCapabilities(logout = ACP.LogoutCapabilities())),
         agent_info = ACP.Implementation(name = "claude-code-acp", title = "Claude Code",
                                         version = string(pkgversion(@__MODULE__))),
-        auth_methods = ACP.AuthMethod[ACP.AuthMethodTerminal(
+        auth_methods = _has_terminal_auth(request) ? ACP.AuthMethod[ACP.AuthMethodTerminal(
             id = "claude-login", name = "Sign in to Claude Code",
-            description = "Run `claude auth login` in a terminal.", args = ["--login"])])
+            description = "Run `claude auth login` in a terminal.", args = ["--login"])] : ACP.AuthMethod[])
+end
+
+# Whether the editor runs a sign-in in a terminal. It says so with
+# `clientCapabilities.auth.terminal`, and only then can the agent name one.
+function _has_terminal_auth(request::ACP.InitializeRequest)
+    capabilities = request.client_capabilities
+    auth = capabilities === nothing ? nothing : capabilities.auth
+    auth !== nothing && auth.terminal === true
+end
+
+# A `claude` that runs keeps its sign-in until it ends. So a sign-out also
+# starts the `claude` of each session again, and that start asks for a sign-in.
+function ACP.answer_request(agent::ClaudeCodeAgent, request::ACP.LogoutRequest, context)
+    agent.settings.run_sign_out(agent.settings.claude_command)
+    for session in lock(() -> collect(values(agent.sessions)), agent.lock)
+        lock(() -> session.needs_restart = true, session.lock)
+    end
+    ACP.LogoutResponse()
 end
 
 ACP.answer_request(agent::ClaudeCodeAgent, request::ACP.AuthenticateRequest, context) = ACP.AuthenticateResponse()
@@ -485,6 +532,7 @@ function ACP.answer_request(agent::ClaudeCodeAgent, request::ACP.PromptRequest, 
         process = session.process
         if process === nothing || session.needs_restart || !is_claude_running(process)
             process === nothing || close_claude_process!(process)
+            _require_sign_in(agent)
             _start_claude!(agent, session)
         end
         # A cancel or a close that came during the start ends the prompt here,

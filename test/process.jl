@@ -39,6 +39,19 @@ end
         @test ClaudeCodeACP.read_claude_sign_in(["claude-code-acp-no-such-program"]) === nothing
     end
 
+    @testset "the sign-out runs claude auth logout and needs its status 0" begin
+        # The fake ends with 0 only when it gets the arguments `auth logout`.
+        logout = ["sh", "-c", "test \"\$1 \$2\" = 'auth logout'", "claude"]
+        @test ClaudeCodeACP.run_claude_sign_out(logout) === nothing
+        failure = try
+            ClaudeCodeACP.run_claude_sign_out(["sh", "-c", "exit 3", "claude"])
+        catch exception
+            exception
+        end
+        @test failure isa ACP.ProtocolException && occursin("status 3", failure.message)
+        @test_throws ACP.ProtocolException ClaudeCodeACP.run_claude_sign_out(["claude-code-acp-no-such-program"])
+    end
+
     @testset "the flag of the thinking display comes from the refusal of a wrong value" begin
         knows(flag_known) = ["sh", "-c", flag_known ?
             "echo \"error: option '--thinking-display <display>' argument 'x' is invalid.\" >&2; exit 1" :

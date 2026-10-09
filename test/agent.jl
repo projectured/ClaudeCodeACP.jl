@@ -67,10 +67,53 @@ collect_text(updates, type) = join(update.content.text for update in updates if 
         @test answer.agent_info.name == "claude-code-acp"
         @test answer.agent_capabilities.session_capabilities.close !== nothing
         @test answer.agent_capabilities.session_capabilities.resume !== nothing
+        @test answer.agent_capabilities.auth.logout !== nothing
+        # An editor that does not say that it runs a sign-in in a terminal gets no such method.
+        @test isempty(answer.auth_methods)
+        ACP.close_connection!(connection)
+
+        agent = ClaudeCodeAgent(AgentSettings(read_sign_in = command -> true))
+        to_agent, to_client = Base.BufferStream(), Base.BufferStream()
+        ACP.open_connection(agent, to_agent, to_client)
+        connection = ACP.open_connection(TestClient(), to_client, to_agent)
+        answer = ACP.send_request!(connection, ACP.InitializeRequest(protocol_version = ACP.PROTOCOL_VERSION,
+            client_capabilities = ACP.ClientCapabilities(auth = ACP.AuthCapabilities(terminal = true))); timeout = 10)
         login = only(answer.auth_methods)
         @test login isa ACP.AuthMethodTerminal
         @test login.args == ["--login"]
         ACP.close_connection!(connection)
+    end
+
+    @testset "a sign-out signs claude out, and the next prompt asks for a sign-in" begin
+        fakes = FakeClaude[]
+        signed_in = Ref(true)
+        test = open_test_agent(AgentSettings(start_claude = make_fake_starter([make_result_turn("one")]; fakes),
+                                             read_sign_in = command -> signed_in[],
+                                             run_sign_out = command -> (signed_in[] = false; nothing),
+                                             read_thinking_display = command -> true))
+        session = open_test_session(test)
+        @test send_test_prompt(test, session.session_id, "Hello.").stop_reason == "end_turn"
+        ACP.send_request!(test.connection, ACP.LogoutRequest(); timeout = 10)
+        @test !signed_in[]
+        failure = try
+            send_test_prompt(test, session.session_id, "Again.")
+        catch exception
+            exception
+        end
+        @test failure isa ACP.ProtocolException && failure.code == ACP.AUTHENTICATION_REQUIRED
+        @test length(fakes) == 1
+        close_test_agent(test)
+
+        # A sign-out that fails gives its error to the editor.
+        test = open_test_agent(AgentSettings(start_claude = make_fake_starter([]), read_sign_in = command -> true,
+            run_sign_out = command -> throw(ACP.ProtocolException(ACP.INTERNAL_ERROR, "no sign-out"))))
+        failure = try
+            ACP.send_request!(test.connection, ACP.LogoutRequest(); timeout = 10)
+        catch exception
+            exception
+        end
+        @test failure isa ACP.ProtocolException && failure.message == "no sign-out"
+        close_test_agent(test)
     end
 
     @testset "a new session starts claude with its flags and the MCP servers" begin
