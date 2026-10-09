@@ -490,7 +490,9 @@ function ACP.answer_request(agent::ClaudeCodeAgent, request::ACP.PromptRequest, 
         # A cancel or a close that came during the start ends the prompt here,
         # before `claude` gets the message.
         lock(() -> session.is_cancelled, session.lock) && return ACP.PromptResponse(stop_reason = "cancelled")
-        if session.title === nothing
+        # Only the first prompt of a session names it. A resumed session has its
+        # title in the editor already, so a later prompt does not rename it.
+        if session.title === nothing && !session.has_history
             session.title = make_title(request.prompt)
             session.title === nothing ||
                 ACP.send_session_update!(connection, session.id, ACP.SessionInfoUpdate(title = session.title))

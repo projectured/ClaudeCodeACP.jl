@@ -266,6 +266,18 @@ collect_text(updates, type) = join(update.content.text for update in updates if 
         close_test_agent(test)
     end
 
+    @testset "a resumed session keeps its title: its first prompt gives none" begin
+        fakes = FakeClaude[]
+        test = open_test_agent(make_test_settings([make_result_turn("again")]; fakes))
+        id = "9c7e1f0a-2b3d-4e5f-8a6b-7c8d9e0f1a2b"
+        ACP.send_request!(test.connection, ACP.ResumeSessionRequest(session_id = id, cwd = TEST_FOLDER); timeout = 10)
+        @test send_test_prompt(test, id, "Go on.").stop_reason == "end_turn"
+        arguments = only(fakes).arguments
+        @test arguments[findfirst(==("--resume"), arguments) + 1] == id
+        @test !any(update -> update isa ACP.SessionInfoUpdate, test.client.updates)
+        close_test_agent(test)
+    end
+
     @testset "a claude that ends in a turn gives an error, and the next prompt starts it again" begin
         fakes = FakeClaude[]
         test = open_test_agent(make_test_settings([[Dict{String,Any}("type" => "_exit")], make_result_turn("again")];

@@ -16,7 +16,8 @@ into the updates of the session:
 - each tool call, with its title, its kind, its file, and a diff for an edit;
 - the plan, from the task list of Claude Code;
 - the commands, the usage of the context and the cost estimate;
-- the title of the session, from the first prompt that it gets.
+- the title of a new session, from its first prompt. A resumed session gets no
+  new title, so the editor keeps the title that it has.
 
 Before Claude Code runs a tool that needs your word, the agent asks the editor,
 which shows you the question with "Allow", "Always allow" and "Reject". A cancel
