@@ -71,11 +71,12 @@ mutable struct ClaudeCodeAgent <: ACP.AgentHandler
     permission::Union{Nothing,PermissionServer}
     connection::Union{Nothing,ACP.Connection}
     has_thinking_display::Union{Nothing,Bool}
+    has_question_forms::Bool
     lock::ReentrantLock
 end
 
 ClaudeCodeAgent(settings::AgentSettings = AgentSettings()) =
-    ClaudeCodeAgent(settings, Dict{String,ClaudeSession}(), nothing, nothing, nothing, ReentrantLock())
+    ClaudeCodeAgent(settings, Dict{String,ClaudeSession}(), nothing, nothing, nothing, false, ReentrantLock())
 
 # --- The options of a session ------------------------------------------------
 
@@ -130,6 +131,9 @@ function make_claude_arguments(agent::ClaudeCodeAgent, session::ClaudeSession, m
                        "--settings", JSON.json(Dict("showThinkingSummaries" => true)),
                        "--permission-prompt-tool", PERMISSION_TOOL_NAME]
     _has_thinking_display!(agent) && append!(arguments, ["--thinking-display", "summarized"])
+    # An editor that can not show a form gets no question from the tool, and
+    # Claude asks in its text.
+    agent.has_question_forms || push!(arguments, "--disallowedTools=AskUserQuestion")
     append!(arguments, session.has_history ? ["--resume", session.id] : ["--session-id", session.id])
     for option in SESSION_OPTIONS
         option.id in session.chosen_options || continue
@@ -350,6 +354,7 @@ end
 
 function ACP.answer_request(agent::ClaudeCodeAgent, request::ACP.InitializeRequest, context)
     agent.connection = context.connection
+    agent.has_question_forms = _has_question_forms(request)
     ACP.InitializeResponse(
         protocol_version = ACP.PROTOCOL_VERSION,
         agent_capabilities = ACP.AgentCapabilities(
@@ -364,6 +369,14 @@ function ACP.answer_request(agent::ClaudeCodeAgent, request::ACP.InitializeReque
         auth_methods = _has_terminal_auth(request) ? ACP.AuthMethod[ACP.AuthMethodTerminal(
             id = "claude-login", name = "Sign in to Claude Code",
             description = "Run `claude auth login` in a terminal.", args = ["--login"])] : ACP.AuthMethod[])
+end
+
+# Whether the editor shows a form for a question: it says so with
+# `clientCapabilities.elicitation.form`.
+function _has_question_forms(request::ACP.InitializeRequest)
+    capabilities = request.client_capabilities
+    elicitation = capabilities === nothing ? nothing : capabilities.elicitation
+    elicitation !== nothing && elicitation.form !== nothing
 end
 
 # Whether the editor runs a sign-in in a terminal. It says so with
@@ -740,9 +753,10 @@ function decide_permission!(agent::ClaudeCodeAgent, session::ClaudeSession, tool
         (session.is_cancelled || !session.is_prompting) ? :refused :
         tool_name in session.always_allowed ? :allowed : :asked
     end
-    state === :allowed && return _make_allow_decision(input)
     state === :refused &&
         return _make_deny_decision("No prompt runs in this session, so nobody can allow this call.")
+    tool_name == "AskUserQuestion" && agent.has_question_forms && return ask_questions!(agent, session, input)
+    state === :allowed && return _make_allow_decision(input)
     connection = agent.connection
     connection === nothing && return _make_deny_decision("No editor is connected, so nobody can allow this call.")
     tool_call = ACP.ToolCallUpdate(tool_call_id = tool_use_id, title = format_tool_title(tool_name, input),
@@ -783,4 +797,99 @@ function decide_permission!(agent::ClaudeCodeAgent, session::ClaudeSession, tool
 end
 
 _make_allow_decision(input::Dict{String,Any}) = Dict{String,Any}("behavior" => "allow", "updatedInput" => input)
+
+"""
+    ask_questions!(agent, session, input) -> Dict
+
+The decision on a call of `AskUserQuestion`: the questions of Claude go to the
+editor as one form, through `elicitation/create`, and the answers come back in
+the input of the tool, which Claude then reads. A decline, a cancel, and a form
+without an answer are denied with a message for Claude.
+"""
+function ask_questions!(agent::ClaudeCodeAgent, session::ClaudeSession, input::Dict{String,Any})
+    connection = agent.connection
+    connection === nothing && return _make_deny_decision("No editor is connected, so nobody can answer.")
+    questions = Dict{String,Any}[question for question in get(input, "questions", Any[]) if question isa Dict{String,Any}]
+    request = try
+        ACP.start_request!(connection, ACP.CreateElicitationRequestForm(
+            message = length(questions) == 1 ? "Claude asks a question." : "Claude asks $(length(questions)) questions.",
+            requested_schema = make_question_schema(questions), session_id = session.id))
+    catch exception
+        exception isa ACP.ProtocolException || exception isa Base.IOError || rethrow()
+        return _make_deny_decision("No answer can come from the editor.")
+    end
+    # A cancel that came while the form started withdraws it at once.
+    is_cancelled = lock(session.lock) do
+        push!(session.waiting_permissions, request)
+        session.is_cancelled
+    end
+    is_cancelled && _cancel_quietly!(request)
+    answer = try
+        ACP.wait_for_answer(request)
+    catch exception
+        exception isa ACP.ProtocolException || rethrow()
+        nothing
+    finally
+        lock(() -> filter!(waiting -> waiting !== request, session.waiting_permissions), session.lock)
+    end
+    answer isa ACP.CreateElicitationResponseAccept || return _make_deny_decision("The person declined to answer.")
+    content = get(ACP.get_json(answer), "content", nothing)
+    _make_allow_decision(Dict{String,Any}("questions" => input["questions"],
+                                          "answers" => read_question_answers(questions,
+                                                                             content isa AbstractDict ? content : Dict{String,Any}())))
+end
+
+"""
+    make_question_schema(questions) -> ACP.ElicitationSchema
+
+The form of the questions of `AskUserQuestion`. The question `i` is the field
+`question_i`, a choice of its options, or a choice of several for a
+`multiSelect` question, with its header as the title and the question as the
+description; and the text field `question_i_other`, for an answer in the words
+of the person. No field is required, so a person can answer with the text alone.
+The names keep the order of the questions in the order of the names.
+"""
+function make_question_schema(questions::AbstractVector)
+    properties = Dict{String,Any}()
+    for (index, question) in enumerate(questions)
+        options = ACP.EnumOption[ACP.EnumOption(const_ = string(get(option, "label", "")),
+                                                title = string(get(option, "label", "")),
+                                                description = get(option, "description", nothing))
+                                 for option in get(question, "options", Any[]) if option isa AbstractDict]
+        title = string(get(question, "header", "Question $(index)"))
+        description = string(get(question, "question", ""))
+        properties["question_$(index)"] = get(question, "multiSelect", false) === true ?
+            ACP.MultiSelectPropertySchema(title = title, description = description,
+                                          items = ACP.TitledMultiSelectItems(any_of = options)) :
+            ACP.StringPropertySchema(title = title, description = description, one_of = options)
+        properties["question_$(index)_other"] =
+            ACP.StringPropertySchema(title = "Other", description = "An answer in your own words to: " * description)
+    end
+    ACP.ElicitationSchema(type = "object", properties = properties)
+end
+
+"""
+    read_question_answers(questions, content) -> Dict{String,Any}
+
+The `answers` of `AskUserQuestion` from the values of the form: for each
+question that has an answer, its text and the answer, which is the text of the
+person when it is not empty, else the label of the chosen option, or the labels
+of the chosen options joined with ", ".
+"""
+function read_question_answers(questions::AbstractVector, content::AbstractDict)
+    answers = Dict{String,Any}()
+    for (index, question) in enumerate(questions)
+        text = string(get(question, "question", ""))
+        own = get(content, "question_$(index)_other", nothing)
+        chosen = get(content, "question_$(index)", nothing)
+        if own isa AbstractString && !isempty(strip(own))
+            answers[text] = String(strip(own))
+        elseif chosen isa AbstractVector && !isempty(chosen)
+            answers[text] = join(string.(chosen), ", ")
+        elseif chosen isa AbstractString && !isempty(chosen)
+            answers[text] = String(chosen)
+        end
+    end
+    answers
+end
 _make_deny_decision(message::String) = Dict{String,Any}("behavior" => "deny", "message" => message)

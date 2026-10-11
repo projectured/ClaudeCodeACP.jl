@@ -24,6 +24,13 @@ which shows you the question with "Allow", "Always allow" and "Reject". A cancel
 in the editor stops the turn. The mode, the model and the effort are options of
 the session.
 
+When Claude asks you a question with its tool `AskUserQuestion`, an editor that
+shows forms (`clientCapabilities.elicitation.form`) gets the questions as one
+form, `elicitation/create`: a choice for each question, of one option or of
+several, and a text field for an answer in your own words. Your answers go back
+to Claude. An editor that shows no form gets no such question: Claude then asks
+in its text.
+
 The agent needs no Node.js and no API key. It uses the sign-in of Claude Code
 and reads no credential. To an editor that can run a sign-in in a terminal, it
 names the sign-in `claude-login`, which runs `claude-code-acp --login`. An editor

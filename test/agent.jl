@@ -6,10 +6,20 @@ mutable struct TestClient <: ACP.ClientHandler
     questions::Vector{Any}
     choice::Union{Nothing,String}
     on_update::Function
+    forms::Vector{Any}
+    form_content::Any
 end
 
-TestClient(; choice = "allow", on_update = (client, update) -> nothing) =
-    TestClient(Any[], Any[], choice, on_update)
+# A client that answers each permission question with `choice`, and each form
+# with `form_content`, or declines it when that is `nothing`.
+TestClient(; choice = "allow", on_update = (client, update) -> nothing, form_content = nothing) =
+    TestClient(Any[], Any[], choice, on_update, Any[], form_content)
+
+function ACP.answer_request(client::TestClient, request::ACP.CreateElicitationRequest, context)
+    push!(client.forms, request)
+    client.form_content === nothing && return ACP.CreateElicitationResponseDecline()
+    ACP.CreateElicitationResponseAccept(content = client.form_content)
+end
 
 function ACP.receive_notification(client::TestClient, notification::ACP.SessionNotification, connection)
     push!(client.updates, notification.update)
@@ -28,13 +38,14 @@ function ACP.answer_request(client::TestClient, request::ACP.RequestPermissionRe
 end
 
 # An agent with `settings`, and a client connected to it.
-function open_test_agent(settings::AgentSettings; client = TestClient())
+function open_test_agent(settings::AgentSettings; client = TestClient(), client_capabilities = nothing)
     agent = ClaudeCodeAgent(settings)
     to_agent = Base.BufferStream()
     to_client = Base.BufferStream()
     agent_connection = ACP.open_connection(agent, to_agent, to_client)
     connection = ACP.open_connection(client, to_client, to_agent)
-    ACP.send_request!(connection, ACP.InitializeRequest(protocol_version = ACP.PROTOCOL_VERSION); timeout = 10)
+    ACP.send_request!(connection, ACP.InitializeRequest(protocol_version = ACP.PROTOCOL_VERSION,
+                                                        client_capabilities = client_capabilities); timeout = 10)
     (; agent, connection, agent_connection, client)
 end
 
@@ -394,6 +405,62 @@ collect_text(updates, type) = join(update.content.text for update in updates if 
         @test [option.kind for option in question.options] == ["allow_always", "allow_once", "reject_once"]
         # Outside a prompt nobody can answer, so the call is denied.
         @test call_permission_tool(only(fakes), "Read", Dict{String,Any}("file_path" => "/a"))["behavior"] == "deny"
+        close_test_agent(test)
+    end
+
+    @testset "the questions of AskUserQuestion go to the editor as a form, and the answers come back" begin
+        questions = Any[
+            Dict{String,Any}("question" => "Which colour?", "header" => "Colour", "multiSelect" => false,
+                             "options" => Any[Dict{String,Any}("label" => "Red", "description" => "warm"),
+                                              Dict{String,Any}("label" => "Blue", "description" => "cool")]),
+            Dict{String,Any}("question" => "Which parts?", "header" => "Parts", "multiSelect" => true,
+                             "options" => Any[Dict{String,Any}("label" => "A", "description" => ""),
+                                              Dict{String,Any}("label" => "B", "description" => "")]),
+            Dict{String,Any}("question" => "Which size?", "header" => "Size", "multiSelect" => false,
+                             "options" => Any[Dict{String,Any}("label" => "S", "description" => ""),
+                                              Dict{String,Any}("label" => "M", "description" => "")])]
+        input = Dict{String,Any}("questions" => questions)
+        forms = ACP.ClientCapabilities(elicitation = ACP.ElicitationCapabilities(form = ACP.ElicitationFormCapabilities()))
+        decisions = Any[]
+        on_call = fake -> push!(decisions, call_permission_tool(fake, "AskUserQuestion", input))
+        fakes = FakeClaude[]
+        client = TestClient(form_content = Dict("question_1" => "Red", "question_2" => ["A", "B"],
+                                                "question_3" => "S", "question_3_other" => "extra large"))
+        test = open_test_agent(make_test_settings([vcat([Dict{String,Any}("type" => "_call")], make_result_turn("ok"))];
+                                                  on_call, fakes); client, client_capabilities = forms)
+        session = open_test_session(test)
+        send_test_prompt(test, session.session_id, "Ask me.")
+        @test only(decisions) == Dict{String,Any}("behavior" => "allow", "updatedInput" => Dict{String,Any}(
+            "questions" => questions,
+            "answers" => Dict{String,Any}("Which colour?" => "Red", "Which parts?" => "A, B",
+                                          "Which size?" => "extra large")))
+        # No permission question: the form is the question.
+        @test isempty(client.questions)
+        schema = ACP.get_json(only(client.forms))["requestedSchema"]
+        @test sort(collect(keys(schema["properties"]))) ==
+              ["question_1", "question_1_other", "question_2", "question_2_other", "question_3", "question_3_other"]
+        colour = schema["properties"]["question_1"]
+        @test (colour["type"], colour["title"], colour["description"]) == ("string", "Colour", "Which colour?")
+        @test [(option["const"], option["description"]) for option in colour["oneOf"]] == [("Red", "warm"), ("Blue", "cool")]
+        @test schema["properties"]["question_2"]["type"] == "array"
+        @test !("--disallowedTools=AskUserQuestion" in only(fakes).arguments)
+        close_test_agent(test)
+
+        # A decline is a deny, with a message for Claude.
+        decisions = Any[]
+        test = open_test_agent(make_test_settings([vcat([Dict{String,Any}("type" => "_call")], make_result_turn("ok"))];
+                                                  on_call); client = TestClient(), client_capabilities = forms)
+        session = open_test_session(test)
+        send_test_prompt(test, session.session_id, "Ask me.")
+        @test only(decisions) == Dict{String,Any}("behavior" => "deny", "message" => "The person declined to answer.")
+        close_test_agent(test)
+
+        # An editor that can not show a form: claude starts without the tool.
+        fakes = FakeClaude[]
+        test = open_test_agent(make_test_settings([make_result_turn("ok")]; fakes))
+        session = open_test_session(test)
+        send_test_prompt(test, session.session_id, "Hello.")
+        @test "--disallowedTools=AskUserQuestion" in only(fakes).arguments
         close_test_agent(test)
     end
 
