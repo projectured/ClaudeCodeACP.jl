@@ -24,6 +24,11 @@ which shows you the question with "Allow", "Always allow" and "Reject". A cancel
 in the editor stops the turn. The mode, the model and the effort are options of
 the session.
 
+A message that you write while Claude works goes into the turn that runs,
+through the extension method `_session/steering`, which the agent advertises as
+`_meta.steering.supported`: Claude reads it at its next step, or in a turn of
+its own just after the one that runs, and the prompt ends after that turn.
+
 When Claude asks you a question with its tool `AskUserQuestion`, an editor that
 shows forms (`clientCapabilities.elicitation.form`) gets the questions as one
 form, `elicitation/create`: a choice for each question, of one option or of

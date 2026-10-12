@@ -79,6 +79,7 @@ collect_text(updates, type) = join(update.content.text for update in updates if 
         @test answer.agent_capabilities.session_capabilities.close !== nothing
         @test answer.agent_capabilities.session_capabilities.resume !== nothing
         @test answer.agent_capabilities.auth.logout !== nothing
+        @test ACP.get_json(answer)["_meta"]["steering"]["supported"] === true
         # An editor that does not say that it runs a sign-in in a terminal gets no such method.
         @test isempty(answer.auth_methods)
         ACP.close_connection!(connection)
@@ -461,6 +462,34 @@ collect_text(updates, type) = join(update.content.text for update in updates if 
         session = open_test_session(test)
         send_test_prompt(test, session.session_id, "Hello.")
         @test "--disallowedTools=AskUserQuestion" in only(fakes).arguments
+        close_test_agent(test)
+    end
+
+    @testset "a message while the turn runs goes to claude, and the prompt ends after the turn that takes it" begin
+        fakes = FakeClaude[]
+        steered = Any[]
+        session_id = Ref("")
+        steer(text) = ACP.send_request!(test_connection[], "_session/steering",
+            ACP.get_json(ACP.PromptRequest(session_id = session_id[], prompt = [ACP.TextContent(text = text)]));
+            timeout = 10)
+        test_connection = Ref{Any}(nothing)
+        on_call = fake -> push!(steered, steer("Also this."))
+        turns = [vcat(make_text_events("Working."), [Dict{String,Any}("type" => "_call")], make_result_turn("first")),
+                 vcat(make_text_events("Also done."), make_result_turn("second"))]
+        test = open_test_agent(make_test_settings(turns; on_call, fakes))
+        test_connection[] = test.connection
+        session = open_test_session(test)
+        session_id[] = session.session_id
+        @test send_test_prompt(test, session.session_id, "Work.").stop_reason == "end_turn"
+        @test only(steered) == Dict{String,Any}("outcome" => "injected")
+        # The prompt went on through the turn that took the message.
+        @test collect_text(test.client.updates, ACP.AgentMessageChunk) == "Working.Also done."
+        fake = only(fakes)
+        @test "--replay-user-messages" in fake.arguments
+        @test [message["message"]["content"][1]["text"] for message in fake.received
+               if get(message, "type", nothing) == "user"] == ["Work.", "Also this."]
+        # No prompt runs now, so a message can not go in.
+        @test steer("Late.") == Dict{String,Any}("outcome" => "failed")
         close_test_agent(test)
     end
 

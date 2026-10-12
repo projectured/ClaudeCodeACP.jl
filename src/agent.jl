@@ -34,6 +34,9 @@ One session of the agent: its id, which is also the session id of `claude`, its
 folder, the MCP servers of the editor, the text that the editor adds to the
 system prompt, the secret of its permission tool and the private folder of its
 configuration, its options, its `claude` process, and the state of its turns.
+While a prompt runs, `sent_messages` counts the user messages that went to
+`claude` for it, `taken_messages` the ones that `claude` echoed when a turn took
+them, and `is_steerable` says that a message can still go into it.
 """
 mutable struct ClaudeSession
     id::String
@@ -55,6 +58,9 @@ mutable struct ClaudeSession
     is_prompting::Bool
     is_cancelled::Bool
     is_closed::Bool
+    sent_messages::Int
+    taken_messages::Int
+    is_steerable::Bool
     waiting_permissions::Vector{ACP.OutgoingRequest}
     lock::ReentrantLock
 end
@@ -127,7 +133,7 @@ function make_claude_arguments(agent::ClaudeCodeAgent, session::ClaudeSession, m
                                system_prompt_path::Union{Nothing,String} = nothing)
     arguments = String[agent.settings.claude_command..., "-p",
                        "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
-                       "--include-partial-messages",
+                       "--include-partial-messages", "--replay-user-messages",
                        "--settings", JSON.json(Dict("showThinkingSummaries" => true)),
                        "--permission-prompt-tool", PERMISSION_TOOL_NAME]
     _has_thinking_display!(agent) && append!(arguments, ["--thinking-display", "summarized"])
@@ -357,6 +363,9 @@ function ACP.answer_request(agent::ClaudeCodeAgent, request::ACP.InitializeReque
     agent.has_question_forms = _has_question_forms(request)
     ACP.InitializeResponse(
         protocol_version = ACP.PROTOCOL_VERSION,
+        # The extension method `_session/steering` takes a prompt into the turn
+        # that runs, as `claude-agent-acp` names it.
+        meta = Dict{String,Any}("steering" => Dict{String,Any}("supported" => true)),
         agent_capabilities = ACP.AgentCapabilities(
             load_session = false,
             prompt_capabilities = ACP.PromptCapabilities(image = false, audio = false, embedded_context = true),
@@ -422,7 +431,7 @@ function _open_session!(agent::ClaudeCodeAgent, id::String, directory::String, m
     session = ClaudeSession(id, directory, collect(Any, mcp_servers), system_prompt, make_session_secret(), mktempdir(),
                             Dict(option.id => "default" for option in SESSION_OPTIONS), Set{String}(),
                             nothing, String[], has_history, false, nothing, String[], Set{String}(), TurnState(),
-                            false, false, false, ACP.OutgoingRequest[], ReentrantLock())
+                            false, false, false, 0, 0, false, ACP.OutgoingRequest[], ReentrantLock())
     is_open = lock(agent.lock) do
         haskey(agent.sessions, id) || (agent.sessions[id] = session; return false)
         true
@@ -570,7 +579,12 @@ function ACP.answer_request(agent::ClaudeCodeAgent, request::ACP.PromptRequest, 
             session.title === nothing ||
                 ACP.send_session_update!(connection, session.id, ACP.SessionInfoUpdate(title = session.title))
         end
-        send_user_message!(session.process, content)
+        lock(session.lock) do
+            send_user_message!(session.process, content)
+            session.sent_messages = 1
+            session.taken_messages = 0
+            session.is_steerable = true
+        end
         session.has_history = true
         ACP.PromptResponse(stop_reason = _follow_turn!(session, connection))
     catch
@@ -598,9 +612,20 @@ function _follow_turn!(session::ClaudeSession, connection::ACP.Connection)
             throw(ACP.ProtocolException(ACP.INTERNAL_ERROR, "Claude Code ended before the end of the turn."))
         elseif type == "system" && get(event, "subtype", nothing) == "init"
             _read_init!(session, event, connection)
+        elseif type == "user" && get(event, "isReplay", false) === true
+            # Claude Code echoes each user message when a turn takes it.
+            lock(() -> session.taken_messages += 1, session.lock)
         elseif type == "result"
             _send_usage!(session, event, connection)
-            return _read_stop_reason(session, event)
+            # A message that came after the last call of the model of the turn
+            # starts a turn of its own after this result, and the prompt goes on
+            # with it. The last result also ends the steering of the prompt.
+            is_waiting = lock(session.lock) do
+                is_waiting = session.taken_messages < session.sent_messages && get(event, "is_error", false) !== true
+                is_waiting || (session.is_steerable = false)
+                is_waiting
+            end
+            is_waiting || return _read_stop_reason(session, event)
         else
             for update in translate_event!(session.state, event)
                 ACP.send_session_update!(connection, session.id, update)
@@ -735,6 +760,36 @@ function ACP.receive_notification(agent::ClaudeCodeAgent, notification::ACP.Canc
     foreach(_cancel_quietly!, requests)
     process === nothing || interrupt_claude!(process)
     nothing
+end
+
+# --- A message while a turn runs ---------------------------------------------
+
+"""
+    answer_request(agent, "_session/steering", params, context)
+
+The extension method `_session/steering` of `claude-agent-acp`: `params` are
+`{sessionId, prompt}`, as a `session/prompt` gives them, for the prompt that
+runs. The message goes to `claude`, which takes it at the next call of the model
+of its turn, or in a turn of its own just after that turn; the prompt that runs
+ends after the turn that takes it. The answer is the outcome `injected`, or
+`failed` when no prompt can take it.
+"""
+function ACP.answer_request(agent::ClaudeCodeAgent, method::String, params, context)
+    method == "_session/steering" ||
+        throw(ACP.ProtocolException(ACP.METHOD_NOT_FOUND, "The method `$(method)` is not served."))
+    params isa AbstractDict ||
+        throw(ACP.ProtocolException(ACP.INVALID_PARAMS, "`_session/steering` takes `sessionId` and `prompt`."))
+    session = _get_session(agent, string(get(params, "sessionId", "")))
+    content = _make_claude_content(ACP.PromptRequest(Dict{String,Any}(params)).prompt)
+    is_sent = lock(session.lock) do
+        process = session.process
+        (session.is_steerable && !session.is_cancelled && process !== nothing && is_claude_running(process)) ||
+            return false
+        send_user_message!(process, content)
+        session.sent_messages += 1
+        true
+    end
+    Dict{String,Any}("outcome" => is_sent ? "injected" : "failed")
 end
 
 # --- A question for the person -----------------------------------------------

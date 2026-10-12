@@ -1,5 +1,6 @@
 # A fake `claude` in the test process. It answers each user message of the
-# agent with the events of the next turn of its script. The fakes of one starter
+# agent with the events of the next turn of its script, after its echo when the
+# agent started it with `--replay-user-messages`. The fakes of one starter
 # share the script, so a `claude` that the agent starts again goes on with the
 # next turn. In a turn, the event
 # `{"type": "_wait_for_interrupt"}` waits for the interrupt message of the
@@ -69,6 +70,9 @@ function _play_fake_turns(fake::FakeClaude, messages::Channel)
             get(message, "type", nothing) == "user" || continue
             fake.next_turn[] += 1
             fake.next_turn[] <= length(fake.turns) || break
+            "--replay-user-messages" in fake.arguments &&
+                write(fake.from_claude, JSON.json(Dict("type" => "user", "isReplay" => true,
+                                                       "message" => get(message, "message", nothing))), '\n')
             for event in fake.turns[fake.next_turn[]]
                 kind = get(event, "type", nothing)
                 if kind == "_wait_for_interrupt"
@@ -108,6 +112,15 @@ function call_permission_tool(fake::FakeClaude, tool_name, input; secret = nothi
     answer = JSON.parse(String(response.body); dicttype = Dict{String,Any})
     JSON.parse(answer["result"]["content"][1]["text"]; dicttype = Dict{String,Any})
 end
+
+# The events of a text that streams, in the shape of `--include-partial-messages`.
+make_text_events(text) = Dict{String,Any}[
+    Dict{String,Any}("type" => "stream_event", "event" => Dict{String,Any}(
+        "type" => "content_block_start", "index" => 0,
+        "content_block" => Dict{String,Any}("type" => "text", "text" => ""))),
+    Dict{String,Any}("type" => "stream_event", "event" => Dict{String,Any}(
+        "type" => "content_block_delta", "index" => 0,
+        "delta" => Dict{String,Any}("type" => "text_delta", "text" => text)))]
 
 # A turn that ends with a result and nothing else.
 make_result_turn(text; is_error = false, subtype = "success") = Dict{String,Any}[
