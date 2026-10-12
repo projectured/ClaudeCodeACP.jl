@@ -362,21 +362,25 @@ collect_text(updates, type) = join(update.content.text for update in updates if 
         close_test_agent(test)
     end
 
-    @testset "a prompt takes text, a link to a file and an embedded text" begin
+    @testset "a prompt takes text, a link to a file, an embedded text and a picture" begin
         fakes = FakeClaude[]
         test = open_test_agent(make_test_settings([make_result_turn("ok")]; fakes))
         session = open_test_session(test)
         ACP.send_request!(test.connection, ACP.PromptRequest(session_id = session.session_id, prompt = [
             ACP.TextContent(text = "Look at"),
             ACP.ResourceLink(name = "a b.jl", uri = "file:///work/a%20b.jl"),
-            ACP.EmbeddedResource(resource = ACP.TextResourceContents(uri = "file:///work/b.jl", text = "x = 1"))]);
+            ACP.EmbeddedResource(resource = ACP.TextResourceContents(uri = "file:///work/b.jl", text = "x = 1")),
+            ACP.ImageContent(data = "AQID", mime_type = "image/png")]);
             timeout = 10)
         message = only(m for m in only(fakes).received if m["type"] == "user")
-        @test [block["text"] for block in message["message"]["content"]] ==
+        content = message["message"]["content"]
+        @test [block["text"] for block in content[1:3]] ==
               ["Look at", "@/work/a b.jl", "<context ref=\"file:///work/b.jl\">\nx = 1\n</context>"]
+        @test content[4] == Dict{String,Any}("type" => "image", "source" => Dict{String,Any}(
+            "type" => "base64", "media_type" => "image/png", "data" => "AQID"))
         image = try
             ACP.send_request!(test.connection, ACP.PromptRequest(session_id = session.session_id,
-                prompt = [ACP.ImageContent(data = "", mime_type = "image/png")]); timeout = 10)
+                prompt = [ACP.ImageContent(data = "AQID", mime_type = "image/bmp")]); timeout = 10)
         catch exception
             exception
         end

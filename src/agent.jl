@@ -368,7 +368,7 @@ function ACP.answer_request(agent::ClaudeCodeAgent, request::ACP.InitializeReque
         meta = Dict{String,Any}("steering" => Dict{String,Any}("supported" => true)),
         agent_capabilities = ACP.AgentCapabilities(
             load_session = false,
-            prompt_capabilities = ACP.PromptCapabilities(image = false, audio = false, embedded_context = true),
+            prompt_capabilities = ACP.PromptCapabilities(image = true, audio = false, embedded_context = true),
             mcp_capabilities = ACP.McpCapabilities(http = true, sse = true),
             session_capabilities = ACP.SessionCapabilities(close = ACP.SessionCloseCapabilities(),
                                                            resume = ACP.SessionResumeCapabilities()),
@@ -716,8 +716,8 @@ function make_title(prompt::AbstractVector)
 end
 
 # The blocks of a prompt as the content of a user message of `claude`. A link
-# to a file becomes a mention of its path, and an embedded text becomes text
-# with its address.
+# to a file becomes a mention of its path, an embedded text becomes text with its
+# address, and a picture becomes an image with its bytes in base64.
 function _make_claude_content(prompt::AbstractVector)
     content = Dict{String,Any}[]
     for block in prompt
@@ -726,17 +726,26 @@ function _make_claude_content(prompt::AbstractVector)
         elseif block isa ACP.ResourceLink
             path = _find_file_path(block.uri)
             push!(content, Dict{String,Any}("type" => "text", "text" => path === nothing ? block.uri : "@" * path))
+        elseif block isa ACP.ImageContent
+            block.mime_type in _IMAGE_TYPES && !isempty(block.data) ||
+                throw(ACP.ProtocolException(ACP.INVALID_PARAMS,
+                    "This agent takes a picture in base64, of the type " * join(_IMAGE_TYPES, ", ", " or ") * "."))
+            push!(content, Dict{String,Any}("type" => "image", "source" => Dict{String,Any}(
+                "type" => "base64", "media_type" => block.mime_type, "data" => block.data)))
         elseif block isa ACP.EmbeddedResource && block.resource isa ACP.TextResourceContents
             resource = block.resource
             push!(content, Dict{String,Any}("type" => "text", "text" =>
                 "<context ref=\"$(resource.uri)\">\n$(resource.text)\n</context>"))
         else
             throw(ACP.ProtocolException(ACP.INVALID_PARAMS,
-                                        "This agent takes text, links and embedded text, not a $(nameof(typeof(block)))."))
+                                        "This agent takes text, pictures, links and embedded text, not a $(nameof(typeof(block)))."))
         end
     end
     content
 end
+
+# The types of a picture that Claude reads.
+const _IMAGE_TYPES = ("image/png", "image/jpeg", "image/gif", "image/webp")
 
 # The path of a `file:` URI, decoded, or `nothing` for another URI.
 function _find_file_path(uri::AbstractString)
