@@ -121,6 +121,10 @@ editor ──ACP──▶ claude-code-acp ──stream-json──▶ claude -p  
 - The agent serves a small MCP server on the loopback address, and gives Claude
   Code its tool with `--permission-prompt-tool`. Each session has its own
   random bearer secret for it.
+- `claude` gives each MCP server two minutes to connect (`MCP_TIMEOUT=120000`),
+  unless the environment sets `MCP_TIMEOUT`. The servers of an editor that hosts
+  the agent run in the process of the editor, which can be slow to answer its
+  first request, and a server that misses the time is gone for the session.
 - A cancel sends the interrupt message of the stream when Claude Code offers
   it, and `SIGINT` else.
 - A `Read` of a text file goes to the editor as a resource: the text as it is in

@@ -31,6 +31,15 @@ end
         end
     end
 
+    @testset "claude gives its MCP servers two minutes, unless the environment says otherwise" begin
+        withenv("MCP_TIMEOUT" => nothing) do
+            @test ClaudeCodeACP.make_claude_environment()["MCP_TIMEOUT"] == "120000"
+        end
+        withenv("MCP_TIMEOUT" => "5000") do
+            @test ClaudeCodeACP.make_claude_environment()["MCP_TIMEOUT"] == "5000"
+        end
+    end
+
     @testset "the sign-in comes from the field loggedIn" begin
         status(text) = ["sh", "-c", "printf '%s' '$(text)'", "claude"]
         @test ClaudeCodeACP.read_claude_sign_in(status("""{"loggedIn": true, "email": "a@b.c"}""")) === true

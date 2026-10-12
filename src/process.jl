@@ -31,7 +31,18 @@ const PARENT_SESSION_VARIABLES = ("CLAUDECODE", "CLAUDE_PID", "CLAUDE_CODE_SESSI
     "CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_CODE_SESSION_ATTENDED", "CLAUDE_CODE_EXECPATH",
     "CLAUDE_AGENT_SDK_VERSION")
 
-make_claude_environment() = Dict{String,String}(filter(pair -> !(first(pair) in PARENT_SESSION_VARIABLES), ENV))
+# The time in milliseconds that `claude` gives each MCP server to connect, when
+# the environment does not set `MCP_TIMEOUT`: two minutes. The MCP servers of an
+# editor that hosts the agent run in the process of the editor, which can be slow
+# to answer its first request, and a server that misses the time of `claude`
+# (30 s) is gone for the whole session.
+const MCP_TIMEOUT_MILLISECONDS = "120000"
+
+function make_claude_environment()
+    environment = Dict{String,String}(filter(pair -> !(first(pair) in PARENT_SESSION_VARIABLES), ENV))
+    get!(environment, "MCP_TIMEOUT", MCP_TIMEOUT_MILLISECONDS)
+    environment
+end
 
 """
     open_claude_process(streams::Tuple{IO,IO}; capabilities) -> ClaudeProcess
