@@ -8,7 +8,10 @@ One `claude -p` process: the stream that takes its messages, and the events
 that it writes, one JSON object on each line. A task reads the events into
 `events`; the last event is `{"type": "process_exit"}`. A `control_response` to
 a control request that waits for its answer goes to `waiting_answers`, by its
-request id, and not to `events`. `capabilities` holds the capabilities of its
+request id, and not to `events`. As it reads, the task counts the `result`s in
+`read_results`, and `is_turn_running` says that a turn runs: from the first
+event of a turn of the session after a `result` to the next `result`.
+`state_lock` guards these three. `capabilities` holds the capabilities of its
 last `system/init`.
 """
 mutable struct ClaudeProcess
@@ -18,7 +21,9 @@ mutable struct ClaudeProcess
     output::IO
     events::Channel{Dict{String,Any}}
     waiting_answers::Dict{String,Channel{Dict{String,Any}}}
-    answer_lock::ReentrantLock
+    read_results::Int
+    is_turn_running::Bool
+    state_lock::ReentrantLock
     capabilities::Vector{String}
     write_lock::ReentrantLock
     is_closed::Bool
@@ -62,7 +67,7 @@ function open_claude_process(streams::Tuple{IO,IO}; process::Union{Nothing,Base.
     input, output = streams
     claude = ClaudeProcess(process, process === nothing ? Int32(0) : Int32(getpid(process)),
                            input, output, Channel{Dict{String,Any}}(Inf),
-                           Dict{String,Channel{Dict{String,Any}}}(), ReentrantLock(), copy(capabilities),
+                           Dict{String,Channel{Dict{String,Any}}}(), 0, false, ReentrantLock(), copy(capabilities),
                            ReentrantLock(), false, false, false, Threads.Atomic{Bool}(false))
     errormonitor(@async _read_claude_events!(claude))
     claude
@@ -107,7 +112,9 @@ function _read_claude_events!(claude::ClaudeProcess)
                 capabilities = get(event, "capabilities", nothing)
                 capabilities isa AbstractVector && (claude.capabilities = String[string(item) for item in capabilities])
             end
-            _take_control_answer!(claude, event) || put!(claude.events, event)
+            _take_control_answer!(claude, event) && continue
+            _count_turn!(claude, event)
+            put!(claude.events, event)
         end
     catch exception
         claude.is_closed || exception isa Base.IOError || @warn "The reader of claude stopped." exception
@@ -124,11 +131,39 @@ function _take_control_answer!(claude::ClaudeProcess, event::Dict{String,Any})
     response = get(event, "response", nothing)
     request_id = response isa AbstractDict ? get(response, "request_id", nothing) : nothing
     request_id isa AbstractString || return false
-    answer = lock(() -> pop!(claude.waiting_answers, request_id, nothing), claude.answer_lock)
+    answer = lock(() -> pop!(claude.waiting_answers, request_id, nothing), claude.state_lock)
     answer === nothing && return false
     put!(answer, Dict{String,Any}(response))
     true
 end
+
+# A `result` ends the turn that runs. The first event of a turn of the session
+# after it, its `system/init` or a message or a stream event that is not of a
+# subagent, starts the next one.
+function _count_turn!(claude::ClaudeProcess, event::Dict{String,Any})
+    type = get(event, "type", nothing)
+    if type == "result"
+        lock(claude.state_lock) do
+            claude.read_results += 1
+            claude.is_turn_running = false
+        end
+    elseif type == "system" ? get(event, "subtype", nothing) == "init" :
+           type in ("assistant", "user", "stream_event") && get(event, "parent_tool_use_id", nothing) === nothing
+        lock(() -> claude.is_turn_running = true, claude.state_lock)
+    end
+    nothing
+end
+
+"""
+    count_earlier_results(claude) -> Int
+
+The `result`s of `claude` that come before the `result` of a message that goes
+to it now: the ones read so far, and the one of the turn that runs. `claude`
+takes its messages one after the other, so a message waits for the turn that
+runs.
+"""
+count_earlier_results(claude::ClaudeProcess) =
+    lock(() -> claude.read_results + (claude.is_turn_running ? 1 : 0), claude.state_lock)
 
 # The event `process_exit`, once.
 _report_exit!(claude::ClaudeProcess) =
@@ -176,7 +211,7 @@ function stop_claude_task!(claude::ClaudeProcess, task_id::AbstractString)
     (claude.is_closed || claude.is_ending) && return "Claude Code does not run."
     request_id = string(uuid4())
     answer = Channel{Dict{String,Any}}(1)
-    lock(() -> claude.waiting_answers[request_id] = answer, claude.answer_lock)
+    lock(() -> claude.waiting_answers[request_id] = answer, claude.state_lock)
     try
         _send_control_request!(claude, Dict{String,Any}("subtype" => "stop_task", "task_id" => String(task_id));
                                request_id)
@@ -188,7 +223,7 @@ function stop_claude_task!(claude::ClaudeProcess, task_id::AbstractString)
         message isa AbstractString && !isempty(message) ? String(message) :
             "Claude Code did not stop `$(task_id)`."
     finally
-        lock(() -> delete!(claude.waiting_answers, request_id), claude.answer_lock)
+        lock(() -> delete!(claude.waiting_answers, request_id), claude.state_lock)
     end
 end
 

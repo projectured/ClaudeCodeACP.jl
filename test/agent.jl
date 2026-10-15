@@ -761,20 +761,38 @@ count_usage(client) = count(update -> update isa ACP.UsageUpdate, client.updates
                 push!(decisions, call_permission_tool(fake, "Bash", Dict{String,Any}("command" => "ls")))
         end
         fakes = FakeClaude[]
-        turns = [vcat(make_text_events("One."), make_result_turn("one"), [Dict{String,Any}("type" => "_call")],
-                      make_text_events("Self."), make_result_turn("self"; is_error = true)),
+        turns = [vcat(make_text_events("One."), make_result_turn("one"), make_text_events("Self."),
+                      [Dict{String,Any}("type" => "_call")], make_result_turn("self"; is_error = true)),
                  vcat([Dict{String,Any}("type" => "_call")], make_text_events("Two."), make_result_turn("two"))]
         test = open_test_agent(make_test_settings(turns; on_call, fakes))
         session = open_test_session(test)
         @test send_test_prompt(test, session.session_id, "One.").stop_reason == "end_turn"
         # The second prompt goes to claude while claude runs a turn of its own,
         # which then fails.
+        @test wait_until(() -> endswith(collect_text(test.client.updates, ACP.AgentMessageChunk), "Self."))
         prompt = @async send_test_prompt(test, session.session_id, "Two.")
         @test wait_until(() -> count(message -> message["type"] == "user", only(fakes).received) == 2)
         put!(released, true)
         @test fetch(prompt).stop_reason == "end_turn"
         @test only(decisions)["behavior"] == "allow"
         @test collect_text(test.client.updates, ACP.AgentMessageChunk) == "One.Self.Two."
+        @test length(fakes) == 1
+        close_test_agent(test)
+    end
+
+    @testset "a prompt whose turn fails before its echo ends with the error of the turn" begin
+        fakes = FakeClaude[]
+        turns = [vcat([Dict{String,Any}("type" => "_no_echo")], make_result_turn("API Error: 500"; is_error = true)),
+                 make_result_turn("two")]
+        test = open_test_agent(make_test_settings(turns; fakes))
+        session = open_test_session(test)
+        failure = try
+            send_test_prompt(test, session.session_id, "One.")
+        catch exception
+            exception
+        end
+        @test failure isa ACP.ProtocolException && failure.message == "API Error: 500"
+        @test send_test_prompt(test, session.session_id, "Two.").stop_reason == "end_turn"
         @test length(fakes) == 1
         close_test_agent(test)
     end

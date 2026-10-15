@@ -36,9 +36,10 @@ system prompt, the secret of its permission tool and the private folder of its
 configuration, its options, its `claude` process, the translation of its events,
 and the state of its turns. While a prompt runs, `sent_messages` counts the user
 messages that went to `claude` for it, `taken_messages` the ones that `claude`
-echoed when a turn took them, `is_steerable` says that a message can still go
-into it, and `prompt_end` takes its stop reason or its error from the reader of
-the events. `reported_process` is the process whose id went to the editor.
+echoed when a turn took them, `earlier_results` the `result`s of its `claude`
+that came or come before the one of its first message, `is_steerable` says that
+a message can still go into it, and `prompt_end` takes its stop reason or its
+error from the reader of the events. `reported_process` is the process whose id went to the editor.
 `send_lock` keeps the messages of the translation in their order; a task that
 holds it may take `lock`, and never the other way round.
 """
@@ -64,6 +65,7 @@ mutable struct ClaudeSession
     is_closed::Bool
     sent_messages::Int
     taken_messages::Int
+    earlier_results::Int
     is_steerable::Bool
     prompt_end::Union{Nothing,Channel{Any}}
     reported_process::Union{Nothing,ClaudeProcess}
@@ -458,7 +460,7 @@ function _open_session!(agent::ClaudeCodeAgent, id::String, directory::String, m
     session = ClaudeSession(id, directory, collect(Any, mcp_servers), system_prompt, make_session_secret(), mktempdir(),
                             Dict(option.id => "default" for option in SESSION_OPTIONS), Set{String}(),
                             nothing, String[], has_history, false, nothing, String[], Set{String}(),
-                            SessionTranslation(id; features = agent.features), false, false, false, 0, 0, false,
+                            SessionTranslation(id; features = agent.features), false, false, false, 0, 0, 0, false,
                             nothing, nothing, ACP.OutgoingRequest[], ReentrantLock(), ReentrantLock())
     is_open = lock(agent.lock) do
         haskey(agent.sessions, id) || (agent.sessions[id] = session; return false)
@@ -642,6 +644,7 @@ function ACP.answer_request(agent::ClaudeCodeAgent, request::ACP.PromptRequest, 
         lock(session.lock) do
             is_claude_running(session.process) ||
                 throw(ACP.ProtocolException(ACP.INTERNAL_ERROR, "Claude Code ended before the end of the turn."))
+            session.earlier_results = count_earlier_results(session.process)
             send_user_message!(session.process, content)
             session.sent_messages = 1
             session.taken_messages = 0
@@ -693,15 +696,19 @@ end
 # end of the process ends the work that still runs in it. The events of a
 # process that the session no longer has go nowhere.
 function _follow_claude!(agent::ClaudeCodeAgent, session::ClaudeSession, process::ClaudeProcess)
+    # The `result`s of the process so far, in the order and the count of
+    # `count_earlier_results`.
+    results = 0
     while true
         event = take!(process.events)
+        get(event, "type", nothing) == "result" && (results += 1)
         is_exit = get(event, "type", nothing) == "process_exit"
         is_current, prompt_end = lock(() -> (session.process === process, session.prompt_end), session.lock)
         if is_current
             is_exit && _end_claude_work!(agent, session, process,
                                          process.is_closed || process.is_ending ? "stopped" : "failed")
             outcome = try
-                _follow_event!(agent, session, process, event, prompt_end !== nothing)
+                _follow_event!(agent, session, process, event, prompt_end !== nothing, results)
             catch exception
                 prompt_end === nothing && !(exception isa ACP.ProtocolException || exception isa Base.IOError) &&
                     @warn "An event of claude between two prompts failed." exception
@@ -722,12 +729,16 @@ end
 # One event of `claude`, sent to the editor, while a prompt runs or between two
 # prompts. Answers the end of the prompt when the event ends it: its stop
 # reason, or the `FailedTurn` of a `result` that failed; and `nothing` else.
-# Throws the error of a process that ended in a prompt. A `result` ends the
-# prompt when the prompt is cancelled or `claude` took each of its messages;
-# another one ends a turn that `claude` started by itself, and sends only the
-# usage, as a `result` between two prompts does.
+# Throws the error of a process that ended in a prompt. `results` counts the
+# `result`s of the process up to this event. A `result` ends the prompt when the
+# prompt is cancelled, when `claude` took each of its messages, or, for a prompt
+# of one message, when the `result`s that came before its message are past, so
+# a turn that fails before its echo ends it too. Another one ends a turn that
+# `claude` started by itself, and sends only the usage, as a `result` between
+# two prompts does. A message of the steering may join the turn that runs, so a
+# prompt with more messages ends only when `claude` took them all.
 function _follow_event!(agent::ClaudeCodeAgent, session::ClaudeSession, process::ClaudeProcess,
-                        event::Dict{String,Any}, is_prompting::Bool)
+                        event::Dict{String,Any}, is_prompting::Bool, results::Int)
     connection = agent.connection
     (is_prompting || connection !== nothing) || return nothing
     type = get(event, "type", nothing)
@@ -745,7 +756,10 @@ function _follow_event!(agent::ClaudeCodeAgent, session::ClaudeSession, process:
         _send_usage!(session, event, connection)
         lock(() -> empty!(session.translation.state.tool_calls), session.lock)
         is_prompting || return nothing
-        is_ending = lock(() -> session.is_cancelled || session.taken_messages >= session.sent_messages, session.lock)
+        is_ending = lock(session.lock) do
+            session.is_cancelled || session.taken_messages >= session.sent_messages ||
+                session.sent_messages == 1 && results > session.earlier_results
+        end
         is_ending || return nothing
         return try
             _read_stop_reason(session, event)

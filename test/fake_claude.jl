@@ -7,7 +7,8 @@
 # agent, `{"type": "_call"}` calls `on_call(fake)`, so a test can act as
 # `claude` during a turn, and `{"type": "_exit"}` ends the fake. The events of a
 # turn after its `result` are a turn that `claude` starts by itself, with no
-# message of the agent. The fake answers the control request `stop_task` with a
+# message of the agent. A turn that starts with `{"type": "_no_echo"}` gives no
+# echo of its message. The fake answers the control request `stop_task` with a
 # `control_response`: a success, or the error `stop_error`.
 
 const JSON = ClaudeCodeACP.JSON
@@ -99,12 +100,15 @@ function _play_fake_turns(fake::FakeClaude, messages::Channel)
             get(message, "type", nothing) == "user" || continue
             fake.next_turn[] += 1
             fake.next_turn[] <= length(fake.turns) || break
-            "--replay-user-messages" in fake.arguments &&
+            turn = fake.turns[fake.next_turn[]]
+            is_echoed = isempty(turn) || get(first(turn), "type", nothing) != "_no_echo"
+            "--replay-user-messages" in fake.arguments && is_echoed &&
                 _write_fake_event(fake, Dict("type" => "user", "isReplay" => true,
                                              "message" => get(message, "message", nothing)))
-            for event in fake.turns[fake.next_turn[]]
+            for event in turn
                 kind = get(event, "type", nothing)
-                if kind == "_wait_for_interrupt"
+                if kind == "_no_echo"
+                elseif kind == "_wait_for_interrupt"
                     take!(fake.interrupts)
                 elseif kind == "_call"
                     fake.on_call(fake)

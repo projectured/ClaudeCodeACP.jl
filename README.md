@@ -103,7 +103,9 @@ The agent reads what `claude` writes also between two prompts. When a
 background task ends after a turn, `claude` starts a turn by itself. That turn
 reaches the editor at once, as updates of the session. A prompt ends with the
 `result` of a turn that took its message, not with the `result` of a turn that
-`claude` started by itself. A turn that fails at its `result` keeps `claude`
+`claude` started by itself. `claude` takes its messages one after the other, so
+the agent knows which `result` is the one of the prompt, also when the turn
+fails before it takes the message. A turn that fails at its `result` keeps `claude`
 and the work that runs in it.
 
 ## Install
