@@ -8,12 +8,16 @@ mutable struct TestClient <: ACP.ClientHandler
     on_update::Function
     forms::Vector{Any}
     form_content::Any
+    session_updates::Vector{Pair{String,Any}}
+    notifications::Vector{Pair{String,Any}}
 end
 
 # A client that answers each permission question with `choice`, and each form
-# with `form_content`, or declines it when that is `nothing`.
+# with `form_content`, or declines it when that is `nothing`. `updates` holds the
+# updates of all sessions, `session_updates` each with its session id, and
+# `notifications` the extension notifications with their method.
 TestClient(; choice = "allow", on_update = (client, update) -> nothing, form_content = nothing) =
-    TestClient(Any[], Any[], choice, on_update, Any[], form_content)
+    TestClient(Any[], Any[], choice, on_update, Any[], form_content, Pair{String,Any}[], Pair{String,Any}[])
 
 function ACP.answer_request(client::TestClient, request::ACP.CreateElicitationRequest, context)
     push!(client.forms, request)
@@ -23,8 +27,12 @@ end
 
 function ACP.receive_notification(client::TestClient, notification::ACP.SessionNotification, connection)
     push!(client.updates, notification.update)
+    push!(client.session_updates, notification.session_id => notification.update)
     client.on_update(client, notification.update)
 end
+
+ACP.receive_notification(client::TestClient, method::String, params, connection) =
+    push!(client.notifications, method => params)
 
 function ACP.answer_request(client::TestClient, request::ACP.RequestPermissionRequest, context)
     push!(client.questions, request)
@@ -66,6 +74,26 @@ send_test_prompt(test, session_id, text) =
                                                          prompt = [ACP.TextContent(text = text)]); timeout = 20)
 
 collect_text(updates, type) = join(update.content.text for update in updates if update isa type)
+
+# The text that the stream events of the session in `events` give, without the
+# text of a subagent, which streams none.
+collect_stream_text(events) = join(event["event"]["delta"]["text"] for event in events
+    if event["type"] == "stream_event" && get(event["event"], "type", nothing) == "content_block_delta" &&
+       event["event"]["delta"]["type"] == "text_delta")
+
+# The capabilities of a client that takes every update beyond version 1 of ACP.
+make_all_capabilities() = ACP.ClientCapabilities(
+    subagents = ACP.SubagentCapabilities(), plan = ACP.PlanCapabilities(),
+    session = ACP.ClientSessionCapabilities(notices = ACP.NoticeCapabilities(), compaction = ACP.CompactionCapabilities()),
+    meta = Dict{String,Any}("backgroundTasks" => Dict{String,Any}()))
+
+# The updates of version 1 of ACP that the recordings give.
+const VERSION_1_UPDATES = Union{ACP.AgentMessageChunk,ACP.AgentThoughtChunk,ACP.ToolCall,ACP.ToolCallUpdate,ACP.Plan,
+                                ACP.AvailableCommandsUpdate,ACP.ConfigOptionUpdate,ACP.SessionInfoUpdate,ACP.UsageUpdate}
+
+wait_until(condition) = timedwait(condition, 10.0) === :ok
+
+count_usage(client) = count(update -> update isa ACP.UsageUpdate, client.updates)
 
 @testset "the agent" begin
     @testset "initialize names the agent and the way to sign in" begin
@@ -562,6 +590,192 @@ collect_text(updates, type) = join(update.content.text for update in updates if 
         @test !any(message -> message["type"] == "user", last(fakes).received)
         put!(gate, true)
         @test send_test_prompt(test, session.session_id, "Two.").stop_reason == "end_turn"
+        close_test_agent(test)
+    end
+
+    @testset "initialize advertises the background tasks" begin
+        test = open_test_agent(make_test_settings([]))
+        answer = ACP.send_request!(test.connection, ACP.InitializeRequest(protocol_version = ACP.PROTOCOL_VERSION);
+                                   timeout = 10)
+        @test ACP.get_json(answer)["_meta"]["backgroundTasks"] == Dict{String,Any}("supported" => true)
+        close_test_agent(test)
+    end
+
+    @testset "a subagent is a child session: its prompt, its messages, its progress, its end, and its stop" begin
+        recorded = read_recorded("subagent.jsonl")
+        first_result = findfirst(event -> event["type"] == "result", recorded)
+        released = Channel{Bool}(1)
+        fakes = FakeClaude[]
+        # The fake waits after the first result, until the test lets it go on.
+        turns = [vcat(recorded[1:first_result], [Dict{String,Any}("type" => "_call")], recorded[first_result + 1:end]),
+                 make_result_turn("next")]
+        test = open_test_agent(make_test_settings(turns; fakes, on_call = fake -> take!(released));
+                               client_capabilities = make_all_capabilities())
+        session = open_test_session(test)
+        @test send_test_prompt(test, session.session_id, "Start a subagent.").stop_reason == "end_turn"
+        task_id = "af50c6aab42df01d9"
+        updates = test.client.session_updates
+        announce = only(update for update in updates if last(update) isa ACP.SubagentUpdate)
+        @test first(announce) == session.session_id
+        announce = last(announce)
+        @test (announce.session_id, announce.title, announce.description) ==
+              (task_id, "List and count files in current directory", "general-purpose")
+        @test announce.state isa ACP.RunningStateUpdate
+        @test announce.capabilities.cancel !== nothing
+        prompt = last(only(update for update in updates if first(update) == task_id))
+        @test prompt isa ACP.UserMessageChunk
+        @test startswith(prompt.content.text, "Use Glob to list all files in the current working directory")
+        # A cancel of the child session stops the subagent.
+        ACP.send_notification!(test.connection, ACP.CancelNotification(session_id = task_id))
+        @test wait_until(() -> any(message -> message["type"] == "control_request", only(fakes).received))
+        @test only(message for message in only(fakes).received if message["type"] == "control_request")["request"] ==
+              Dict{String,Any}("subtype" => "stop_task", "task_id" => task_id)
+        # The subagent works and ends after the result, and claude starts a
+        # turn by itself: it all reaches the client, with no prompt.
+        put!(released, true)
+        @test wait_until(() -> count_usage(test.client) == 2)
+        child = [last(update) for update in updates if first(update) == task_id]
+        message = only(update for update in child if update isa ACP.AgentMessageChunk)
+        @test startswith(message.content.text, "I found **3 files** in the directory `/work`")
+        @test message.message_id == "msg_011Cg3emRzJTKvFPvkYyW3vt"
+        @test only(update for update in child if update isa ACP.ToolCall).name == "Glob"
+        @test only(update for update in child if update isa ACP.ToolCallUpdate).status == "completed"
+        states = [last(update) for update in updates if last(update) isa ACP.SubagentUpdate]
+        @test all(update.session_id == task_id for update in states)
+        @test [typeof(update.state) for update in states] ==
+              [ACP.RunningStateUpdate, ACP.RunningStateUpdate, ACP.IdleStateUpdate, Nothing]
+        @test states[2].meta["claudeCode"] == Dict("usage" => Dict("totalTokens" => 21399, "toolUses" => 1,
+                                                                   "durationMs" => 1857), "lastToolName" => "Glob")
+        @test states[3].state.stop_reason == "end_turn"
+        @test startswith(states[4].meta["claudeCode"]["summary"], "I found **3 files**")
+        @test states[4].meta["claudeCode"]["usage"]["totalTokens"] == 22368
+        main = [last(update) for update in updates if first(update) == session.session_id]
+        @test collect_text(main, ACP.AgentMessageChunk) == collect_stream_text(recorded)
+        # The next prompt gets only its own turn.
+        empty!(test.client.updates)
+        @test send_test_prompt(test, session.session_id, "Next.").stop_reason == "end_turn"
+        @test isempty(test.client.updates)
+        close_test_agent(test)
+    end
+
+    @testset "a background task: its notifications, and its stop" begin
+        recorded = read_recorded("background-task.jsonl")
+        second_start = findfirst(event -> get(event, "subtype", nothing) == "task_started" &&
+                                          event["task_id"] == "b1le9w8sz", recorded)
+        session_id = Ref("")
+        test_connection = Ref{Any}(nothing)
+        answers = Any[]
+        client = TestClient()
+        # The stop comes when the client knows the task.
+        on_call = fake -> begin
+            wait_until(() -> any(notification -> last(notification)["taskId"] == "b1le9w8sz", client.notifications))
+            push!(answers, ACP.send_request!(test_connection[], "_session/stop_background_task",
+                Dict{String,Any}("sessionId" => session_id[], "taskId" => "b1le9w8sz"); timeout = 10))
+        end
+        fakes = FakeClaude[]
+        turns = [vcat(recorded[1:second_start], [Dict{String,Any}("type" => "_call")], recorded[second_start + 1:end])]
+        test = open_test_agent(make_test_settings(turns; on_call, fakes); client,
+                               client_capabilities = make_all_capabilities())
+        test_connection[] = test.connection
+        session = open_test_session(test)
+        session_id[] = session.session_id
+        @test send_test_prompt(test, session.session_id, "Run two commands.").stop_reason == "end_turn"
+        @test only(answers) == Dict{String,Any}()
+        @test only(message for message in only(fakes).received if message["type"] == "control_request")["request"] ==
+              Dict{String,Any}("subtype" => "stop_task", "task_id" => "b1le9w8sz")
+        @test wait_until(() -> count_usage(client) == 2)
+        @test all(first(notification) == "_session/background_task" for notification in client.notifications)
+        find_params(task_id) = [last(notification) for notification in client.notifications
+                                if last(notification)["taskId"] == task_id]
+        @test [params["status"] for params in find_params("byowkisnu")] == ["running", "completed", "completed"]
+        @test [params["status"] for params in find_params("b1le9w8sz")] == ["running", "stopped", "stopped"]
+        started = first(find_params("byowkisnu"))
+        @test started["canStop"] === true && started["startTime"] isa Integer
+        @test !haskey(started, "endTime") && !haskey(started, "outputUri")
+        done = last(find_params("byowkisnu"))
+        @test done == Dict{String,Any}(
+            "sessionId" => session.session_id, "taskId" => "byowkisnu", "kind" => "local_bash",
+            "title" => "Run sleep 5 with echo in background", "status" => "completed",
+            "toolCallId" => "toolu_01KPkTMkdnkzNeqWEm6zu2ZV",
+            "outputUri" => "file:///tmp/claude/work/e1f9a64c-4281-455d-8c50-2ffaa12eb468/tasks/byowkisnu.output",
+            "summary" => "Background command \"Run sleep 5 with echo in background\" completed (exit code 0)",
+            "startTime" => started["startTime"], "endTime" => 1792050400573, "canStop" => false)
+        # A task that does not run can not be stopped.
+        failure = try
+            ACP.send_request!(test.connection, "_session/stop_background_task",
+                              Dict{String,Any}("sessionId" => session.session_id, "taskId" => "byowkisnu"); timeout = 10)
+        catch exception
+            exception
+        end
+        @test failure isa ACP.ProtocolException && failure.code == ACP.INVALID_PARAMS
+        close_test_agent(test)
+    end
+
+    @testset "the plan steps go as items with the blockers in _meta, and the plan mode as Markdown" begin
+        test = open_test_agent(make_test_settings([read_recorded("plan-steps.jsonl")]);
+                               client_capabilities = make_all_capabilities())
+        session = open_test_session(test)
+        send_test_prompt(test, session.session_id, "Plan it.")
+        plans = [update for update in test.client.updates if update isa ACP.PlanUpdate]
+        @test length(plans) == 6
+        @test !any(update -> update isa ACP.Plan, test.client.updates)
+        entries = last(plans).plan.entries
+        @test [(entry.content, entry.status) for entry in entries] ==
+              [("Write a.txt with echo", "completed"), ("Write b.txt with echo", "pending"), ("Report both", "pending")]
+        @test entries[3].meta == Dict("claudeCode" => Dict("taskId" => "3", "description" => "Report both a.txt and b.txt",
+                                                           "blockedBy" => ["2"]))
+        close_test_agent(test)
+
+        # The plan of the plan mode is only in the question for ExitPlanMode.
+        recorded = read_recorded("plan-mode.jsonl")
+        request = only(event for event in recorded if event["type"] == "control_request")["request"]
+        decisions = Any[]
+        on_call = fake -> push!(decisions, call_permission_tool(fake, "ExitPlanMode", request["input"];
+                                                                id = request["tool_use_id"]))
+        turn = Dict{String,Any}[event["type"] == "control_request" ? Dict{String,Any}("type" => "_call") : event
+                                for event in recorded if event["type"] != "control_response"]
+        test = open_test_agent(make_test_settings([turn]; on_call); client = TestClient(choice = "reject"),
+                               client_capabilities = make_all_capabilities())
+        session = open_test_session(test)
+        send_test_prompt(test, session.session_id, "Plan a README.")
+        @test only(decisions)["behavior"] == "deny"
+        markdown = only(update for update in test.client.updates if update isa ACP.PlanUpdate).plan
+        @test markdown isa ACP.PlanMarkdown
+        @test (markdown.plan_id, markdown.content) == ("plan-mode", request["input"]["plan"])
+        close_test_agent(test)
+    end
+
+    @testset "a client with no capability beyond version 1 gets the updates of version 1 only" begin
+        for name in ("subagent.jsonl", "background-task.jsonl", "plan-steps.jsonl", "plan-mode.jsonl")
+            recorded = read_recorded(name)
+            test = open_test_agent(make_test_settings([recorded]))
+            session = open_test_session(test)
+            send_test_prompt(test, session.session_id, "Go.")
+            @test wait_until(() -> count_usage(test.client) == count(event -> event["type"] == "result", recorded))
+            @test all(first(update) == session.session_id for update in test.client.session_updates)
+            @test all(update -> update isa VERSION_1_UPDATES, test.client.updates)
+            @test isempty(test.client.notifications)
+            @test collect_text(test.client.updates, ACP.AgentMessageChunk) == collect_stream_text(recorded)
+            @test count(update -> update isa ACP.Plan, test.client.updates) == (name == "plan-steps.jsonl" ? 6 : 0)
+            close_test_agent(test)
+        end
+    end
+
+    @testset "the process id of claude goes to the client once for each process" begin
+        test = open_test_agent(make_test_settings([make_result_turn("one"), make_result_turn("two"),
+                                                   make_result_turn("three")]; process_id = 2^30))
+        session = open_test_session(test)
+        @test isempty(test.client.updates)
+        process_ids() = [update.meta["processId"] for update in test.client.updates
+                         if update isa ACP.SessionInfoUpdate && update.meta !== nothing]
+        send_test_prompt(test, session.session_id, "One.")
+        @test process_ids() == [2^30]
+        send_test_prompt(test, session.session_id, "Two.")
+        @test process_ids() == [2^30]
+        ACP.send_request!(test.connection, ACP.SetSessionConfigOptionRequestValueId(
+            session_id = session.session_id, config_id = "model", value = "haiku"); timeout = 10)
+        send_test_prompt(test, session.session_id, "Three.")
+        @test process_ids() == [2^30, 2^30]
         close_test_agent(test)
     end
 

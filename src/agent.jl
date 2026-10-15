@@ -33,10 +33,12 @@ end
 One session of the agent: its id, which is also the session id of `claude`, its
 folder, the MCP servers of the editor, the text that the editor adds to the
 system prompt, the secret of its permission tool and the private folder of its
-configuration, its options, its `claude` process, and the state of its turns.
-While a prompt runs, `sent_messages` counts the user messages that went to
-`claude` for it, `taken_messages` the ones that `claude` echoed when a turn took
-them, and `is_steerable` says that a message can still go into it.
+configuration, its options, its `claude` process, the translation of its events,
+and the state of its turns. While a prompt runs, `sent_messages` counts the user
+messages that went to `claude` for it, `taken_messages` the ones that `claude`
+echoed when a turn took them, `is_steerable` says that a message can still go
+into it, and `prompt_end` takes its stop reason or its error from the reader of
+the events. `reported_process` is the process whose id went to the editor.
 """
 mutable struct ClaudeSession
     id::String
@@ -54,13 +56,15 @@ mutable struct ClaudeSession
     title::Union{Nothing,String}
     commands::Vector{String}
     always_allowed::Set{String}
-    state::TurnState
+    translation::SessionTranslation
     is_prompting::Bool
     is_cancelled::Bool
     is_closed::Bool
     sent_messages::Int
     taken_messages::Int
     is_steerable::Bool
+    prompt_end::Union{Nothing,Channel{Any}}
+    reported_process::Union{Nothing,ClaudeProcess}
     waiting_permissions::Vector{ACP.OutgoingRequest}
     lock::ReentrantLock
 end
@@ -78,11 +82,13 @@ mutable struct ClaudeCodeAgent <: ACP.AgentHandler
     connection::Union{Nothing,ACP.Connection}
     has_thinking_display::Union{Nothing,Bool}
     has_question_forms::Bool
+    features::ClientFeatures
     lock::ReentrantLock
 end
 
 ClaudeCodeAgent(settings::AgentSettings = AgentSettings()) =
-    ClaudeCodeAgent(settings, Dict{String,ClaudeSession}(), nothing, nothing, nothing, false, ReentrantLock())
+    ClaudeCodeAgent(settings, Dict{String,ClaudeSession}(), nothing, nothing, nothing, false, ClientFeatures(),
+                    ReentrantLock())
 
 # --- The options of a session ------------------------------------------------
 
@@ -361,11 +367,15 @@ end
 function ACP.answer_request(agent::ClaudeCodeAgent, request::ACP.InitializeRequest, context)
     agent.connection = context.connection
     agent.has_question_forms = _has_question_forms(request)
+    agent.features = _read_client_features(request)
     ACP.InitializeResponse(
         protocol_version = ACP.PROTOCOL_VERSION,
         # The extension method `_session/steering` takes a prompt into the turn
-        # that runs, as `claude-agent-acp` names it.
-        meta = Dict{String,Any}("steering" => Dict{String,Any}("supported" => true)),
+        # that runs, as `claude-agent-acp` names it. The extension notification
+        # `_session/background_task` and the request
+        # `_session/stop_background_task` show and stop the background tasks.
+        meta = Dict{String,Any}("steering" => Dict{String,Any}("supported" => true),
+                                "backgroundTasks" => Dict{String,Any}("supported" => true)),
         agent_capabilities = ACP.AgentCapabilities(
             load_session = false,
             prompt_capabilities = ACP.PromptCapabilities(image = true, audio = false, embedded_context = true),
@@ -386,6 +396,20 @@ function _has_question_forms(request::ACP.InitializeRequest)
     capabilities = request.client_capabilities
     elicitation = capabilities === nothing ? nothing : capabilities.elicitation
     elicitation !== nothing && elicitation.form !== nothing
+end
+
+# The updates beyond version 1 of ACP that the editor takes:
+# `clientCapabilities.subagents`, `.plan`, `.session.notices`,
+# `.session.compaction`, and an object at `._meta.backgroundTasks`.
+function _read_client_features(request::ACP.InitializeRequest)
+    capabilities = request.client_capabilities
+    capabilities === nothing && return ClientFeatures()
+    session = capabilities.session
+    meta = capabilities.meta
+    ClientFeatures(subagents = capabilities.subagents !== nothing, plans = capabilities.plan !== nothing,
+                   notices = session !== nothing && session.notices !== nothing,
+                   compaction = session !== nothing && session.compaction !== nothing,
+                   background_tasks = meta !== nothing && get(meta, "backgroundTasks", nothing) isa AbstractDict)
 end
 
 # Whether the editor runs a sign-in in a terminal. It says so with
@@ -430,8 +454,9 @@ function _open_session!(agent::ClaudeCodeAgent, id::String, directory::String, m
         throw(ACP.ProtocolException(ACP.INVALID_PARAMS, "The folder `$(directory)` is no absolute path of a folder."))
     session = ClaudeSession(id, directory, collect(Any, mcp_servers), system_prompt, make_session_secret(), mktempdir(),
                             Dict(option.id => "default" for option in SESSION_OPTIONS), Set{String}(),
-                            nothing, String[], has_history, false, nothing, String[], Set{String}(), TurnState(),
-                            false, false, false, 0, 0, false, ACP.OutgoingRequest[], ReentrantLock())
+                            nothing, String[], has_history, false, nothing, String[], Set{String}(),
+                            SessionTranslation(id; features = agent.features), false, false, false, 0, 0, false,
+                            nothing, nothing, ACP.OutgoingRequest[], ReentrantLock())
     is_open = lock(agent.lock) do
         haskey(agent.sessions, id) || (agent.sessions[id] = session; return false)
         true
@@ -450,9 +475,9 @@ function _open_session!(agent::ClaudeCodeAgent, id::String, directory::String, m
     session
 end
 
-# Start the `claude` of a session, in place of the one before. A session that
-# closed meanwhile keeps no process: the new one ends at once. Answers whether
-# the session has the new process.
+# Start the `claude` of a session, in place of the one before, and the reader of
+# its events. A session that closed meanwhile keeps no process: the new one ends
+# at once. Answers whether the session has the new process.
 function _start_claude!(agent::ClaudeCodeAgent, session::ClaudeSession)
     previous = session.process
     previous === nothing || isempty(previous.capabilities) || (session.capabilities = copy(previous.capabilities))
@@ -472,7 +497,11 @@ function _start_claude!(agent::ClaudeCodeAgent, session::ClaudeSession)
         session.is_closed || (session.process = process; session.needs_restart = false)
         session.is_closed
     end
-    is_closed && close_claude_process!(process)
+    if is_closed
+        close_claude_process!(process)
+    else
+        errormonitor(@async _follow_claude!(agent, session, process))
+    end
     !is_closed
 end
 
@@ -579,14 +608,23 @@ function ACP.answer_request(agent::ClaudeCodeAgent, request::ACP.PromptRequest, 
             session.title === nothing ||
                 ACP.send_session_update!(connection, session.id, ACP.SessionInfoUpdate(title = session.title))
         end
+        _send_process_id!(session, connection)
+        # The reader of the events gives the prompt its end. A `claude` that
+        # ended before the message went to it gives no events any more.
+        prompt_end = Channel{Any}(1)
         lock(session.lock) do
+            is_claude_running(session.process) ||
+                throw(ACP.ProtocolException(ACP.INTERNAL_ERROR, "Claude Code ended before the end of the turn."))
             send_user_message!(session.process, content)
             session.sent_messages = 1
             session.taken_messages = 0
             session.is_steerable = true
+            session.prompt_end = prompt_end
         end
         session.has_history = true
-        ACP.PromptResponse(stop_reason = _follow_turn!(session, connection))
+        outcome = take!(prompt_end)
+        outcome isa Exception && throw(outcome)
+        ACP.PromptResponse(stop_reason = outcome)
     catch
         # The events of a turn that failed must not reach the next prompt.
         session.needs_restart = true
@@ -594,42 +632,118 @@ function ACP.answer_request(agent::ClaudeCodeAgent, request::ACP.PromptRequest, 
     finally
         lock(session.lock) do
             session.is_prompting = false
-            empty!(session.state.tool_calls)
+            session.prompt_end = nothing
         end
     end
 end
 
-# The events of `claude` until the `result` of the turn, sent to the editor as
-# updates. Answers the stop reason.
-function _follow_turn!(session::ClaudeSession, connection::ACP.Connection)
+# The process id of the `claude` of the session, as `_meta.processId` of a
+# `session_info_update`, once for each process. A prompt sends it, so the
+# editor knows the session already. A `claude` on two streams, as in a test, has
+# no process id.
+function _send_process_id!(session::ClaudeSession, connection::ACP.Connection)
     process = session.process
+    (process === nothing || process === session.reported_process || process.process_id <= 0) && return nothing
+    session.reported_process = process
+    ACP.send_session_update!(connection, session.id, ACP.SessionInfoUpdate(
+        meta = Dict{String,Any}("processId" => Int(process.process_id))))
+    nothing
+end
+
+# The reader of the events of the `claude` of a session, in their order, for as
+# long as the process runs. While a prompt runs, each event goes to it, and the
+# `result` that ends its turn, or the end of the process, gives the prompt its
+# stop reason or its error. Between two prompts, each event goes to the editor at
+# once, so a turn that `claude` starts by itself, when a background task ends,
+# reaches the editor when it runs. The events of a process that the session no
+# longer has go nowhere.
+function _follow_claude!(agent::ClaudeCodeAgent, session::ClaudeSession, process::ClaudeProcess)
     while true
         event = take!(process.events)
-        type = get(event, "type", nothing)
-        if type == "process_exit"
-            session.needs_restart = true
-            lock(() -> session.is_cancelled, session.lock) && return "cancelled"
-            throw(ACP.ProtocolException(ACP.INTERNAL_ERROR, "Claude Code ended before the end of the turn."))
-        elseif type == "system" && get(event, "subtype", nothing) == "init"
+        is_current, prompt_end = lock(() -> (session.process === process, session.prompt_end), session.lock)
+        if is_current && prompt_end === nothing
+            _follow_event_between_prompts!(agent, session, event)
+        elseif is_current
+            outcome = try
+                _follow_prompt_event!(agent, session, event)
+            catch exception
+                exception
+            end
+            if outcome !== nothing
+                lock(session.lock) do
+                    session.prompt_end = nothing
+                    empty!(session.translation.state.tool_calls)
+                end
+                put!(prompt_end, outcome)
+            end
+        end
+        get(event, "type", nothing) == "process_exit" && return nothing
+    end
+end
+
+# One event of `claude` while a prompt runs, sent to the editor. Answers the stop
+# reason of the prompt at its end, and `nothing` while it goes on; throws the
+# error of a turn that failed.
+function _follow_prompt_event!(agent::ClaudeCodeAgent, session::ClaudeSession, event::Dict{String,Any})
+    connection = agent.connection
+    type = get(event, "type", nothing)
+    if type == "process_exit"
+        session.needs_restart = true
+        lock(() -> session.is_cancelled, session.lock) && return "cancelled"
+        throw(ACP.ProtocolException(ACP.INTERNAL_ERROR, "Claude Code ended before the end of the turn."))
+    elseif type == "system" && get(event, "subtype", nothing) == "init"
+        _read_init!(session, event, connection)
+    elseif type == "user" && get(event, "isReplay", false) === true
+        # Claude Code echoes each user message when a turn takes it.
+        lock(() -> session.taken_messages += 1, session.lock)
+    elseif type == "result"
+        _send_usage!(session, event, connection)
+        # A message that came after the last call of the model of the turn
+        # starts a turn of its own after this result, and the prompt goes on
+        # with it. The last result also ends the steering of the prompt.
+        is_waiting = lock(session.lock) do
+            is_waiting = session.taken_messages < session.sent_messages && get(event, "is_error", false) !== true
+            is_waiting || (session.is_steerable = false)
+            is_waiting
+        end
+        is_waiting || return _read_stop_reason(session, event)
+    else
+        _send_event_updates!(session, event, connection)
+    end
+    nothing
+end
+
+# One event of `claude` between two prompts, sent to the editor: a `result`
+# sends only the usage. An editor that is gone gets nothing, and an event that
+# fails leaves the reader for the next one.
+function _follow_event_between_prompts!(agent::ClaudeCodeAgent, session::ClaudeSession, event::Dict{String,Any})
+    connection = agent.connection
+    connection === nothing && return nothing
+    type = get(event, "type", nothing)
+    try
+        if type == "system" && get(event, "subtype", nothing) == "init"
             _read_init!(session, event, connection)
-        elseif type == "user" && get(event, "isReplay", false) === true
-            # Claude Code echoes each user message when a turn takes it.
-            lock(() -> session.taken_messages += 1, session.lock)
         elseif type == "result"
             _send_usage!(session, event, connection)
-            # A message that came after the last call of the model of the turn
-            # starts a turn of its own after this result, and the prompt goes on
-            # with it. The last result also ends the steering of the prompt.
-            is_waiting = lock(session.lock) do
-                is_waiting = session.taken_messages < session.sent_messages && get(event, "is_error", false) !== true
-                is_waiting || (session.is_steerable = false)
-                is_waiting
-            end
-            is_waiting || return _read_stop_reason(session, event)
+        elseif !(type == "process_exit" || type == "user" && get(event, "isReplay", false) === true)
+            _send_event_updates!(session, event, connection)
+        end
+    catch exception
+        exception isa ACP.ProtocolException || exception isa Base.IOError ||
+            @warn "An event of claude between two prompts failed." exception
+    end
+    nothing
+end
+
+# The updates of one event for the session and its subagents, and the
+# notifications of its background tasks.
+function _send_event_updates!(session::ClaudeSession, event::Dict{String,Any}, connection::ACP.Connection)
+    messages = lock(() -> translate_session_event!(session.translation, event), session.lock)
+    for (session_id, message) in messages
+        if message isa BackgroundTaskNotification
+            ACP.send_notification!(connection, "_session/background_task", message.params)
         else
-            for update in translate_event!(session.state, event)
-                ACP.send_session_update!(connection, session.id, update)
-            end
+            ACP.send_session_update!(connection, session_id, message)
         end
     end
 end
@@ -672,7 +786,7 @@ function _send_usage!(session::ClaudeSession, result::Dict{String,Any}, connecti
     size == 0 && return nothing
     cost = get(result, "total_cost_usd", nothing)
     ACP.send_session_update!(connection, session.id, ACP.UsageUpdate(
-        used = session.state.context_used, size = size,
+        used = session.translation.state.context_used, size = size,
         cost = cost isa Real ? ACP.Cost(amount = Float64(cost), currency = "USD") : nothing))
     nothing
 end
@@ -757,9 +871,11 @@ end
 
 # --- A cancel ----------------------------------------------------------------
 
+# A cancel of the child session of a subagent stops that subagent with the
+# control request `stop_task`, and the prompt of its session goes on.
 function ACP.receive_notification(agent::ClaudeCodeAgent, notification::ACP.CancelNotification, connection)
     session = lock(() -> get(agent.sessions, notification.session_id, nothing), agent.lock)
-    session === nothing && return nothing
+    session === nothing && return _stop_subagent!(agent, notification.session_id)
     process, requests = lock(session.lock) do
         session.is_prompting || return (nothing, nothing)
         session.is_cancelled = true
@@ -771,10 +887,23 @@ function ACP.receive_notification(agent::ClaudeCodeAgent, notification::ACP.Canc
     nothing
 end
 
+# Stop the subagent whose child session has the id `task_id`, when it runs.
+function _stop_subagent!(agent::ClaudeCodeAgent, task_id::AbstractString)
+    for session in lock(() -> collect(values(agent.sessions)), agent.lock)
+        process = lock(session.lock) do
+            subagent = get(session.translation.subagents, task_id, nothing)
+            subagent === nothing || subagent.is_idle ? nothing : session.process
+        end
+        process === nothing || return stop_claude_task!(process, task_id)
+    end
+    nothing
+end
+
 # --- A message while a turn runs ---------------------------------------------
 
 """
     answer_request(agent, "_session/steering", params, context)
+    answer_request(agent, "_session/stop_background_task", params, context)
 
 The extension method `_session/steering` of `claude-agent-acp`: `params` are
 `{sessionId, prompt}`, as a `session/prompt` gives them, for the prompt that
@@ -782,8 +911,14 @@ runs. The message goes to `claude`, which takes it at the next call of the model
 of its turn, or in a turn of its own just after that turn; the prompt that runs
 ends after the turn that takes it. The answer is the outcome `injected`, or
 `failed` when no prompt can take it.
+
+The extension method `_session/stop_background_task`: `params` are
+`{sessionId, taskId}`, for a background task that runs, as the notification
+`_session/background_task` names it. `claude` gets the control request
+`stop_task`, and the answer is an empty object.
 """
 function ACP.answer_request(agent::ClaudeCodeAgent, method::String, params, context)
+    method == "_session/stop_background_task" && return _stop_background_task!(agent, params)
     method == "_session/steering" ||
         throw(ACP.ProtocolException(ACP.METHOD_NOT_FOUND, "The method `$(method)` is not served."))
     params isa AbstractDict ||
@@ -801,6 +936,23 @@ function ACP.answer_request(agent::ClaudeCodeAgent, method::String, params, cont
     Dict{String,Any}("outcome" => is_sent ? "injected" : "failed")
 end
 
+function _stop_background_task!(agent::ClaudeCodeAgent, params)
+    task_id = params isa AbstractDict ? get(params, "taskId", nothing) : nothing
+    task_id isa AbstractString || throw(ACP.ProtocolException(ACP.INVALID_PARAMS,
+                                        "`_session/stop_background_task` takes `sessionId` and `taskId`."))
+    session = _get_session(agent, string(get(params, "sessionId", "")))
+    process = lock(session.lock) do
+        task = get(session.translation.background_tasks, task_id, nothing)
+        process = session.process
+        task !== nothing && task.status == "running" && process !== nothing && is_claude_running(process) ?
+            process : nothing
+    end
+    process === nothing && throw(ACP.ProtocolException(ACP.INVALID_PARAMS,
+                                                       "No background task `$(task_id)` runs in this session."))
+    stop_claude_task!(process, task_id)
+    Dict{String,Any}()
+end
+
 # --- A question for the person -----------------------------------------------
 
 """
@@ -813,6 +965,7 @@ prompt, a call after a cancel, and a question without an answer are denied.
 """
 function decide_permission!(agent::ClaudeCodeAgent, session::ClaudeSession, tool_name::String,
                             input::Dict{String,Any}, tool_use_id::String)
+    tool_name == "ExitPlanMode" && _send_plan_mode!(agent, session, input)
     state = lock(session.lock) do
         (session.is_cancelled || !session.is_prompting) ? :refused :
         tool_name in session.always_allowed ? :allowed : :asked
@@ -861,6 +1014,21 @@ function decide_permission!(agent::ClaudeCodeAgent, session::ClaudeSession, tool
 end
 
 _make_allow_decision(input::Dict{String,Any}) = Dict{String,Any}("behavior" => "allow", "updatedInput" => input)
+
+# The plan of the plan mode, which only the question for `ExitPlanMode` holds,
+# goes to an editor that takes plans with an id, before the question.
+function _send_plan_mode!(agent::ClaudeCodeAgent, session::ClaudeSession, input::Dict{String,Any})
+    connection = agent.connection
+    connection === nothing && return nothing
+    update = lock(() -> make_plan_mode_update!(session.translation.state, get(input, "plan", nothing)), session.lock)
+    update === nothing && return nothing
+    try
+        ACP.send_session_update!(connection, session.id, update)
+    catch exception
+        exception isa ACP.ProtocolException || exception isa Base.IOError || rethrow()
+    end
+    nothing
+end
 
 """
     ask_questions!(agent, session, input) -> Dict

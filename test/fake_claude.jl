@@ -5,7 +5,9 @@
 # next turn. In a turn, the event
 # `{"type": "_wait_for_interrupt"}` waits for the interrupt message of the
 # agent, `{"type": "_call"}` calls `on_call(fake)`, so a test can act as
-# `claude` during a turn, and `{"type": "_exit"}` ends the fake.
+# `claude` during a turn, and `{"type": "_exit"}` ends the fake. The events of a
+# turn after its `result` are a turn that `claude` starts by itself, with no
+# message of the agent.
 
 const JSON = ClaudeCodeACP.JSON
 const HTTP = ClaudeCodeACP.HTTP
@@ -26,13 +28,15 @@ read_recorded(name) = Dict{String,Any}[JSON.parse(line; dicttype = Dict{String,A
                                        for line in eachline(joinpath(@__DIR__, "recorded", name))]
 
 """
-    make_fake_starter(turns; on_call, fakes) -> Function
+    make_fake_starter(turns; on_call, fakes, gate, process_id) -> Function
 
 A `start_claude` for `AgentSettings`: each start makes a `FakeClaude` with the
-script `turns` and pushes it to `fakes`.
+script `turns` and pushes it to `fakes`. Its `ClaudeProcess` has the id
+`process_id`, which no process has, and no `Base.Process`, so no signal goes
+to that id.
 """
 function make_fake_starter(turns; on_call::Function = fake -> nothing, fakes::Vector{FakeClaude} = FakeClaude[],
-                           gate::Union{Nothing,Channel} = nothing)
+                           gate::Union{Nothing,Channel} = nothing, process_id::Integer = 0)
     script = [copy(turn) for turn in turns]
     next_turn = Ref(0)
     (arguments, directory; capabilities = String[]) -> begin
@@ -44,7 +48,9 @@ function make_fake_starter(turns; on_call::Function = fake -> nothing, fakes::Ve
         messages = Channel{Dict{String,Any}}(Inf)
         errormonitor(@async _read_fake_input(fake, messages))
         errormonitor(@async _play_fake_turns(fake, messages))
-        ClaudeCodeACP.open_claude_process((fake.to_claude, fake.from_claude); capabilities)
+        claude = ClaudeCodeACP.open_claude_process((fake.to_claude, fake.from_claude); capabilities)
+        claude.process_id = Int32(process_id)
+        claude
     end
 end
 
@@ -54,7 +60,7 @@ function _read_fake_input(fake::FakeClaude, messages::Channel)
             message = JSON.parse(line; dicttype = Dict{String,Any})
             push!(fake.received, message)
             if get(message, "type", nothing) == "control_request"
-                put!(fake.interrupts, true)
+                get(message["request"], "subtype", nothing) == "interrupt" && put!(fake.interrupts, true)
             else
                 put!(messages, message)
             end

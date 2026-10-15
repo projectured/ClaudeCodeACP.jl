@@ -1,40 +1,108 @@
 # From the stream events of `claude` to the session updates of ACP: the chunks of
 # text and of thinking, the tool calls and their results, the plan from the task
-# tools, the commands, and the usage.
+# tools, the commands, and the usage; and, for a client that takes them, the
+# child sessions of the subagents, the background tasks, the plans with an id,
+# the notices and the compactions.
 
 """
-    TurnState
+    ClientFeatures(; subagents, plans, notices, compaction, background_tasks)
 
-What the translation keeps across the events of a session: the id of the
-message that streams, the tool calls by their id, the tasks of the plan, and
-the size of the context of the last request.
+The updates beyond version 1 of ACP that the client takes, as it advertised
+them in `initialize`: the child sessions of the subagents
+(`clientCapabilities.subagents`), the plans with an id (`.plan`), the notices
+(`.session.notices`), the compactions (`.session.compaction`), and the extension
+notification `_session/background_task` (`._meta.backgroundTasks`). A client
+that advertises none of them gets the updates of version 1 only.
+"""
+Base.@kwdef struct ClientFeatures
+    subagents::Bool = false
+    plans::Bool = false
+    notices::Bool = false
+    compaction::Bool = false
+    background_tasks::Bool = false
+end
+
+"""
+    PlanStep
+
+One step of the plan of a session, from `TaskCreate`, `TaskUpdate` or
+`TodoWrite`: its id, which a step of `TodoWrite` lacks, its subject, its status
+(`pending`, `in_progress` or `completed`), its description, the text that shows
+while it runs (`activeForm`), and the ids of the steps that block it.
+"""
+mutable struct PlanStep
+    id::Union{Nothing,String}
+    subject::String
+    status::String
+    description::Union{Nothing,String}
+    active_form::Union{Nothing,String}
+    blocked_by::Vector{String}
+end
+
+"""
+    TurnState(; features = ClientFeatures(), has_stream_events = true)
+
+What the translation keeps across the events of a session or of a subagent: the
+id of the message that streams, the tool calls by their id, the steps of the
+plan, the size of the context of the last request, the updates that the client
+takes, whether the text comes as stream events, as for a session, or only in
+whole messages, as for a subagent, and the last Markdown plan of the plan mode.
 """
 mutable struct TurnState
     message_id::Union{Nothing,String}
     tool_calls::Dict{String,Tuple{String,Dict{String,Any}}}
-    tasks::Vector{Pair{String,ACP.PlanEntry}}
+    plan_steps::Vector{PlanStep}
     context_used::Int
+    features::ClientFeatures
+    has_stream_events::Bool
+    plan_markdown::Union{Nothing,String}
 end
 
-TurnState() = TurnState(nothing, Dict{String,Tuple{String,Dict{String,Any}}}(),
-                        Pair{String,ACP.PlanEntry}[], 0)
+TurnState(; features::ClientFeatures = ClientFeatures(), has_stream_events::Bool = true) =
+    TurnState(nothing, Dict{String,Tuple{String,Dict{String,Any}}}(), PlanStep[], 0, features,
+              has_stream_events, nothing)
 
 """
     translate_event!(state, event) -> Vector{ACP.SessionUpdate}
 
 The session updates of one stream event of `claude`. An event of a subagent,
 whose `parent_tool_use_id` is set, gives none, and so does an event that the
-client does not show.
+client does not show; [`translate_session_event!`](@ref) gives the updates of a
+subagent.
 """
 function translate_event!(state::TurnState, event::Dict{String,Any})
+    get(event, "parent_tool_use_id", nothing) === nothing || return ACP.SessionUpdate[]
+    _translate_message_event!(state, event)
+end
+
+# The updates of a stream event, a message of the assistant, or a message of
+# tool results, of a session or of a subagent. A subagent streams no events, so
+# the text and the thinking of its whole messages become the chunks.
+function _translate_message_event!(state::TurnState, event::Dict{String,Any})
     updates = ACP.SessionUpdate[]
-    get(event, "parent_tool_use_id", nothing) === nothing || return updates
     type = get(event, "type", nothing)
     if type == "stream_event"
-        _translate_stream_event!(updates, state, get(event, "event", Dict{String,Any}()))
+        state.has_stream_events && _translate_stream_event!(updates, state, get(event, "event", Dict{String,Any}()))
     elseif type == "assistant"
+        message = get(event, "message", nothing)
+        id = message isa AbstractDict ? get(message, "id", nothing) : nothing
+        message_id = id isa AbstractString ? String(id) : nothing
         for block in _get_content_blocks(event)
-            get(block, "type", nothing) == "tool_use" && push!(updates, _make_tool_call!(state, block))
+            kind = get(block, "type", nothing)
+            if kind == "tool_use"
+                push!(updates, _make_tool_call!(state, block))
+                if get(block, "name", nothing) == "ExitPlanMode"
+                    input = get(block, "input", nothing)
+                    update = make_plan_mode_update!(state, input isa AbstractDict ? get(input, "plan", nothing) : nothing)
+                    update === nothing || push!(updates, update)
+                end
+            elseif !state.has_stream_events && kind in ("text", "thinking")
+                text = string(get(block, kind, ""))
+                isempty(text) && continue
+                push!(updates, kind == "text" ?
+                    ACP.AgentMessageChunk(content = ACP.TextContent(text = text), message_id = message_id) :
+                    ACP.AgentThoughtChunk(content = ACP.TextContent(text = text), message_id = message_id))
+            end
         end
     elseif type == "user"
         for block in _get_content_blocks(event)
@@ -119,7 +187,8 @@ function _make_tool_result!(state::TurnState, block::Dict{String,Any}, tool_use_
     end
     updates = ACP.SessionUpdate[ACP.ToolCallUpdate(tool_call_id = id, status = is_error ? "failed" : "completed",
                                                    content = content)]
-    is_error || _update_tasks!(state, name, input, tool_use_result) && push!(updates, make_plan(state))
+    is_error || _update_plan_steps!(state, name, input, tool_use_result) &&
+        push!(updates, state.features.plans ? make_plan_update(state) : make_plan(state))
     updates
 end
 
@@ -235,34 +304,375 @@ get_tool_kind(name::AbstractString) =
 
 # --- The plan ----------------------------------------------------------------
 
-# The task tools keep the plan: `TaskCreate` adds a task, whose id its result
-# gives, and `TaskUpdate` changes its status. A status `deleted` removes it.
-# Answers whether the plan changed.
-function _update_tasks!(state::TurnState, name::AbstractString, input::Dict{String,Any}, result)
+# The statuses of a plan step that ACP names.
+const PLAN_STEP_STATUSES = ("pending", "in_progress", "completed")
+
+# The task tools keep the plan: `TaskCreate` adds a step, whose id its result
+# gives, and `TaskUpdate` changes its status, its texts and its blockers. A
+# status `deleted` removes it. `TodoWrite` replaces the whole plan with its
+# `todos`. Answers whether the plan changed.
+function _update_plan_steps!(state::TurnState, name::AbstractString, input::Dict{String,Any}, result)
     if name == "TaskCreate"
         task = result isa AbstractDict ? get(result, "task", nothing) : nothing
         task isa AbstractDict || return false
-        id = string(get(task, "id", ""))
         subject = string(get(task, "subject", get(input, "subject", "")))
-        push!(state.tasks, id => ACP.PlanEntry(content = subject, priority = "medium", status = "pending"))
+        push!(state.plan_steps, PlanStep(string(get(task, "id", "")), subject, "pending", _get_text(input, "description"),
+                                         _get_text(input, "activeForm"), String[]))
         return true
     elseif name == "TaskUpdate"
         id = string(get(input, "taskId", ""))
-        index = findfirst(pair -> first(pair) == id, state.tasks)
+        index = findfirst(step -> step.id == id, state.plan_steps)
         index === nothing && return false
+        step = state.plan_steps[index]
         status = get(input, "status", nothing)
-        subject = get(input, "subject", nothing)
-        entry = last(state.tasks[index])
         if status == "deleted"
-            deleteat!(state.tasks, index)
+            deleteat!(state.plan_steps, index)
+            foreach(other -> filter!(!=(id), other.blocked_by), state.plan_steps)
             return true
         end
-        state.tasks[index] = id => ACP.PlanEntry(
-            content = subject isa AbstractString ? subject : entry.content, priority = entry.priority,
-            status = status in ("pending", "in_progress", "completed") ? status : entry.status)
+        status in PLAN_STEP_STATUSES && (step.status = status)
+        step.subject = something(_get_text(input, "subject"), step.subject)
+        step.description = something(_get_text(input, "description"), Some(step.description))
+        step.active_form = something(_get_text(input, "activeForm"), Some(step.active_form))
+        for blocker in _get_texts(input, "addBlockedBy")
+            blocker in step.blocked_by || push!(step.blocked_by, blocker)
+        end
+        for blocked in _get_texts(input, "addBlocks")
+            other = findfirst(other -> other.id == blocked, state.plan_steps)
+            other === nothing || id in state.plan_steps[other].blocked_by ||
+                push!(state.plan_steps[other].blocked_by, id)
+        end
+        return true
+    elseif name == "TodoWrite"
+        todos = get(input, "todos", nothing)
+        todos isa AbstractVector || return false
+        empty!(state.plan_steps)
+        for todo in todos
+            todo isa AbstractDict || continue
+            status = get(todo, "status", nothing)
+            push!(state.plan_steps, PlanStep(_get_text(todo, "id"), string(get(todo, "content", "")),
+                                             status in PLAN_STEP_STATUSES ? status : "pending", nothing,
+                                             _get_text(todo, "activeForm"), String[]))
+        end
         return true
     end
     false
 end
 
-make_plan(state::TurnState) = ACP.Plan(entries = ACP.PlanEntry[last(pair) for pair in state.tasks])
+# The text at `key` of a JSON object, or `nothing` for no text or an empty one.
+function _get_text(object::AbstractDict, key::String)
+    value = get(object, key, nothing)
+    value isa AbstractString && !isempty(value) ? String(value) : nothing
+end
+
+# The texts of the list at `key` of a JSON object; a number in it counts as its
+# text.
+function _get_texts(object::AbstractDict, key::String)
+    values = get(object, key, nothing)
+    values isa AbstractVector || return String[]
+    String[string(value) for value in values if value isa Union{AbstractString,Integer}]
+end
+
+"""
+    make_plan(state) -> ACP.Plan
+
+The plan of version 1 of ACP: the subject and the status of each step.
+"""
+make_plan(state::TurnState) = ACP.Plan(entries = ACP.PlanEntry[
+    ACP.PlanEntry(content = step.subject, priority = "medium", status = step.status) for step in state.plan_steps])
+
+"""
+    make_plan_update(state) -> ACP.PlanUpdate
+
+The plan of the steps as a `plan_update` of the type `items` with the id
+`tasks`. The `_meta.claudeCode` of each entry holds the keys `taskId`,
+`description`, `activeForm` and `blockedBy` that the step has.
+"""
+make_plan_update(state::TurnState) = ACP.PlanUpdate(plan = ACP.PlanItems(plan_id = "tasks", entries = ACP.PlanEntry[
+    ACP.PlanEntry(content = step.subject, priority = "medium", status = step.status, meta = _make_step_meta(step))
+    for step in state.plan_steps]))
+
+function _make_step_meta(step::PlanStep)
+    fields = Dict{String,Any}()
+    step.id === nothing || (fields["taskId"] = step.id)
+    step.description === nothing || (fields["description"] = step.description)
+    step.active_form === nothing || (fields["activeForm"] = step.active_form)
+    isempty(step.blocked_by) || (fields["blockedBy"] = copy(step.blocked_by))
+    isempty(fields) ? nothing : Dict{String,Any}("claudeCode" => fields)
+end
+
+"""
+    make_plan_mode_update!(state, plan) -> Union{ACP.PlanUpdate,Nothing}
+
+The Markdown plan of the plan mode, the input `plan` of `ExitPlanMode`, as a
+`plan_update` of the type `markdown` with the id `plan-mode`. `nothing` for a
+client that takes no plan with an id, for a plan that is no text, and for the
+plan that went last.
+"""
+function make_plan_mode_update!(state::TurnState, plan)
+    (state.features.plans && plan isa AbstractString && !isempty(plan) && plan != state.plan_markdown) ||
+        return nothing
+    state.plan_markdown = String(plan)
+    ACP.PlanUpdate(plan = ACP.PlanMarkdown(plan_id = "plan-mode", content = state.plan_markdown))
+end
+
+# --- The subagents and the background tasks -----------------------------------
+
+"""
+    Subagent
+
+A subagent of a session, as a child session of ACP: its task id, which is also
+the session id of the child, the session id of its parent, the translation of
+its messages, the fields of `_meta.claudeCode` of its updates, and whether its
+idle state went to the client.
+"""
+mutable struct Subagent
+    task_id::String
+    parent_id::String
+    state::TurnState
+    fields::Dict{String,Any}
+    is_idle::Bool
+end
+
+"""
+    BackgroundTask
+
+Work that `claude` started and that runs after the call that started it, such as
+a command with `run_in_background`: its task id, its kind (the `task_type` of
+`claude`), its title, its status (`running`, `completed`, `failed` or
+`stopped`), the id of the tool call that started it, the `file://` uri of its
+output, its summary, and the times of its start and its end in milliseconds
+since 1970.
+"""
+mutable struct BackgroundTask
+    task_id::String
+    kind::String
+    title::String
+    status::String
+    tool_call_id::Union{Nothing,String}
+    output_uri::Union{Nothing,String}
+    summary::Union{Nothing,String}
+    start_time::Int
+    end_time::Union{Nothing,Int}
+end
+
+"""
+    BackgroundTaskNotification
+
+The extension notification `_session/background_task` with its `params`: the
+whole state of one background task.
+"""
+struct BackgroundTaskNotification
+    params::Dict{String,Any}
+end
+
+"""
+    SessionTranslation(session_id; features = ClientFeatures())
+
+What the translation keeps for one session: its id, the translation of its own
+messages, its subagents by their task id, the task id of each subagent by the
+id of the `Agent` call that started it, and its background tasks by their task
+id.
+"""
+mutable struct SessionTranslation
+    session_id::String
+    state::TurnState
+    subagents::Dict{String,Subagent}
+    subagent_ids::Dict{String,String}
+    background_tasks::Dict{String,BackgroundTask}
+end
+
+SessionTranslation(session_id::String; features::ClientFeatures = ClientFeatures()) =
+    SessionTranslation(session_id, TurnState(; features), Dict{String,Subagent}(), Dict{String,String}(),
+                       Dict{String,BackgroundTask}())
+
+"""
+    translate_session_event!(translation, event) -> Vector{Pair{String,Any}}
+
+What one event of `claude` sends to the client, as `session_id => message`: an
+`ACP.SessionUpdate` of the session or of one of its subagents, or a
+[`BackgroundTaskNotification`](@ref). An event of a subagent goes to its child
+session, through the same translation as an event of the session. The task
+events announce a subagent on its parent and change its state, or change a
+background task; `compact_boundary`, `api_retry` and `model_fallback` give a
+compaction and notices. Each of these goes only to a client that takes it.
+"""
+function translate_session_event!(translation::SessionTranslation, event::Dict{String,Any})
+    messages = Pair{String,Any}[]
+    parent_tool_use_id = get(event, "parent_tool_use_id", nothing)
+    if get(event, "type", nothing) == "system"
+        _translate_system_event!(messages, translation, event)
+    elseif parent_tool_use_id === nothing
+        for update in translate_event!(translation.state, event)
+            push!(messages, translation.session_id => update)
+        end
+    else
+        task_id = get(translation.subagent_ids, string(parent_tool_use_id), nothing)
+        subagent = task_id === nothing ? nothing : get(translation.subagents, task_id, nothing)
+        subagent === nothing && return messages
+        for update in _translate_message_event!(subagent.state, event)
+            push!(messages, subagent.task_id => update)
+        end
+    end
+    messages
+end
+
+function _translate_system_event!(messages, translation::SessionTranslation, event::Dict{String,Any})
+    features = translation.state.features
+    subtype = get(event, "subtype", nothing)
+    task_id = string(get(event, "task_id", ""))
+    if subtype == "task_started" && !isempty(task_id)
+        if get(event, "task_type", nothing) == "local_agent"
+            features.subagents && _start_subagent!(messages, translation, task_id, event)
+        else
+            task = BackgroundTask(task_id, string(get(event, "task_type", "")), string(get(event, "description", "")),
+                                  "running", _get_text(event, "tool_use_id"), nothing, nothing,
+                                  _read_time(get(event, "start_time", nothing)), nothing)
+            translation.background_tasks[task_id] = task
+            _push_background_task!(messages, translation, task)
+        end
+    elseif subtype in ("task_progress", "task_updated", "task_notification")
+        if haskey(translation.subagents, task_id)
+            _update_subagent!(messages, translation.subagents[task_id], subtype, event)
+        elseif haskey(translation.background_tasks, task_id)
+            _update_background_task!(messages, translation, translation.background_tasks[task_id], subtype, event)
+        end
+    elseif subtype == "compact_boundary" && features.compaction
+        id = _get_text(event, "uuid")
+        id === nothing ||
+            push!(messages, translation.session_id => ACP.CompactionUpdate(compaction_id = id, status = "completed"))
+    elseif subtype == "api_retry" && features.notices
+        push!(messages, translation.session_id => ACP.Notice(severity = "warning",
+            title = "API retry $(_format_count(get(event, "attempt", nothing))) of " *
+                    _format_count(get(event, "max_retries", nothing)),
+            description = _format_retry(event)))
+    elseif subtype == "model_fallback" && features.notices
+        original = _get_text(event, "original_model")
+        fallback = _get_text(event, "fallback_model")
+        push!(messages, translation.session_id => ACP.Notice(severity = "warning",
+            title = original === nothing || fallback === nothing ? "The model falls back" :
+                    "The model $(original) falls back to $(fallback)",
+            description = something(_get_text(event, "content"), _get_text(event, "trigger"), Some(nothing))))
+    end
+    nothing
+end
+
+# A subagent announces its child session on its parent: the session, or the
+# subagent whose `Agent` call started it. Its prompt goes into the child session
+# as the message of the user.
+function _start_subagent!(messages, translation::SessionTranslation, task_id::String, event::Dict{String,Any})
+    tool_use_id = _get_text(event, "tool_use_id")
+    parent = tool_use_id === nothing ? nothing :
+             findfirst(subagent -> haskey(subagent.state.tool_calls, tool_use_id), translation.subagents)
+    parent_id = something(parent, translation.session_id)
+    translation.subagents[task_id] = Subagent(task_id, parent_id,
+        TurnState(features = translation.state.features, has_stream_events = false), Dict{String,Any}(), false)
+    tool_use_id === nothing || (translation.subagent_ids[tool_use_id] = task_id)
+    push!(messages, parent_id => ACP.SubagentUpdate(
+        session_id = task_id, title = _get_text(event, "description"), description = _get_text(event, "subagent_type"),
+        state = ACP.RunningStateUpdate(),
+        capabilities = ACP.SubagentSessionCapabilities(cancel = ACP.SessionCancelCapabilities())))
+    prompt = _get_text(event, "prompt")
+    prompt === nothing || push!(messages, task_id => ACP.UserMessageChunk(content = ACP.TextContent(text = prompt)))
+    nothing
+end
+
+# A progress keeps the subagent running; the end of its task, from
+# `task_updated` or `task_notification`, makes it idle, once. The usage, the last
+# tool and the summary go in `_meta.claudeCode`, each update with all of them.
+function _update_subagent!(messages, subagent::Subagent, subtype::String, event::Dict{String,Any})
+    is_changed = _read_task_fields!(subagent.fields, event)
+    patch = get(event, "patch", nothing)
+    status = subtype == "task_notification" ? get(event, "status", nothing) :
+             subtype == "task_updated" && patch isa AbstractDict ? get(patch, "status", nothing) : nothing
+    state = nothing
+    if subtype == "task_progress"
+        subagent.is_idle || (state = ACP.RunningStateUpdate())
+    elseif status in ("completed", "failed", "killed", "stopped") && !subagent.is_idle
+        subagent.is_idle = true
+        state = ACP.IdleStateUpdate(stop_reason = status == "completed" ? "end_turn" :
+                                                  status == "failed" ? nothing : "cancelled")
+    end
+    (state === nothing && !is_changed) && return nothing
+    push!(messages, subagent.parent_id => ACP.SubagentUpdate(
+        session_id = subagent.task_id, state = state,
+        meta = isempty(subagent.fields) ? nothing : Dict{String,Any}("claudeCode" => copy(subagent.fields))))
+    nothing
+end
+
+# The usage, the last tool and the summary of a task event into `fields`, as
+# `usage` (`totalTokens`, `toolUses`, `durationMs`), `lastToolName` and
+# `summary`. Answers whether a field changed.
+function _read_task_fields!(fields::Dict{String,Any}, event::Dict{String,Any})
+    before = copy(fields)
+    usage = get(event, "usage", nothing)
+    if usage isa AbstractDict
+        counts = Dict{String,Any}()
+        for (key, name) in ("total_tokens" => "totalTokens", "tool_uses" => "toolUses", "duration_ms" => "durationMs")
+            value = get(usage, key, nothing)
+            value isa Real && (counts[name] = _read_count(value))
+        end
+        isempty(counts) || (fields["usage"] = counts)
+    end
+    tool = _get_text(event, "last_tool_name")
+    tool === nothing || (fields["lastToolName"] = tool)
+    summary = _get_text(event, "summary")
+    summary === nothing || (fields["summary"] = summary)
+    fields != before
+end
+
+function _update_background_task!(messages, translation::SessionTranslation, task::BackgroundTask,
+                                  subtype::String, event::Dict{String,Any})
+    if subtype == "task_updated"
+        patch = get(event, "patch", nothing)
+        patch isa AbstractDict || return nothing
+        status = get(patch, "status", nothing)
+        status isa AbstractString && (task.status = _get_background_status(status))
+        end_time = get(patch, "end_time", nothing)
+        end_time isa Real && (task.end_time = _read_count(end_time))
+        task.title = something(_get_text(patch, "description"), task.title)
+    elseif subtype == "task_notification"
+        status = get(event, "status", nothing)
+        status isa AbstractString && (task.status = _get_background_status(status))
+        output_file = _get_text(event, "output_file")
+        output_file === nothing || (task.output_uri = "file://" * output_file)
+        task.summary = something(_get_text(event, "summary"), Some(task.summary))
+        task.status == "running" || task.end_time !== nothing || (task.end_time = _read_time(nothing))
+    else
+        return nothing
+    end
+    _push_background_task!(messages, translation, task)
+end
+
+# The status of a background task from the status of `claude`: a killed task
+# counts as stopped, and a pending one as running.
+_get_background_status(status::AbstractString) =
+    status in ("completed", "failed") ? String(status) : status in ("killed", "stopped") ? "stopped" : "running"
+
+function _push_background_task!(messages, translation::SessionTranslation, task::BackgroundTask)
+    translation.state.features.background_tasks || return nothing
+    params = Dict{String,Any}("sessionId" => translation.session_id, "taskId" => task.task_id, "kind" => task.kind,
+                              "title" => task.title, "status" => task.status, "startTime" => task.start_time,
+                              "canStop" => task.status == "running")
+    task.tool_call_id === nothing || (params["toolCallId"] = task.tool_call_id)
+    task.output_uri === nothing || (params["outputUri"] = task.output_uri)
+    task.summary === nothing || (params["summary"] = task.summary)
+    task.end_time === nothing || (params["endTime"] = task.end_time)
+    push!(messages, translation.session_id => BackgroundTaskNotification(params))
+    nothing
+end
+
+# A time in milliseconds since 1970: `value` when it is a number, else now.
+_read_time(value) = value isa Real ? _read_count(value) : round(Int, time() * 1000)
+
+_format_count(value) = value isa Real ? string(_read_count(value)) : "?"
+
+# The description of an `api_retry`: the kind of the error, its HTTP status, and
+# the time until the next try.
+function _format_retry(event::Dict{String,Any})
+    kind = something(_get_text(event, "error"), "error")
+    status = get(event, "error_status", nothing)
+    delay = get(event, "retry_delay_ms", nothing)
+    text = "The request failed: " * kind * (status isa Real ? " (HTTP $(_read_count(status)))." : ".")
+    delay isa Real ? text * " The next try comes in $(round(delay / 1000; digits = 1)) s." : text
+end

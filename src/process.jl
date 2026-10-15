@@ -138,15 +138,35 @@ gets nothing.
 function interrupt_claude!(claude::ClaudeProcess)
     (claude.is_closed || claude.is_ending) && return nothing
     if "interrupt_receipt_v1" in claude.capabilities
-        try
-            _write_claude_line!(claude, Dict{String,Any}("type" => "control_request",
-                "request_id" => string(uuid4()), "request" => Dict{String,Any}("subtype" => "interrupt")))
-        catch exception
-            exception isa Base.IOError || exception isa ErrorException || rethrow()
-        end
+        _send_control_request!(claude, Dict{String,Any}("subtype" => "interrupt"))
     elseif claude.process !== nothing && !process_exited(claude.process)
         claude.is_ending = true
         kill(claude.process, Base.SIGINT)
+    end
+    nothing
+end
+
+"""
+    stop_claude_task!(claude, task_id)
+
+Stop a background task or a subagent of `claude` with the control request
+`stop_task`. A process that is closed or ending gets nothing.
+"""
+function stop_claude_task!(claude::ClaudeProcess, task_id::AbstractString)
+    (claude.is_closed || claude.is_ending) && return nothing
+    _send_control_request!(claude, Dict{String,Any}("subtype" => "stop_task", "task_id" => String(task_id)))
+    nothing
+end
+
+# A control request on the standard input of `claude`, with a new request id.
+# `claude` answers it with a `control_response`, which the agent does not read.
+# A process whose input closed meanwhile gets nothing.
+function _send_control_request!(claude::ClaudeProcess, request::Dict{String,Any})
+    try
+        _write_claude_line!(claude, Dict{String,Any}("type" => "control_request",
+                                                     "request_id" => string(uuid4()), "request" => request))
+    catch exception
+        exception isa Base.IOError || exception isa ErrorException || rethrow()
     end
     nothing
 end
