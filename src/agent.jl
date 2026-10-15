@@ -476,8 +476,9 @@ function _open_session!(agent::ClaudeCodeAgent, id::String, directory::String, m
 end
 
 # Start the `claude` of a session, in place of the one before, and the reader of
-# its events. A session that closed meanwhile keeps no process: the new one ends
-# at once. Answers whether the session has the new process.
+# its events. The subagents and the background tasks that still run in the one
+# before end with it. A session that closed meanwhile keeps no process: the new
+# one ends at once. Answers whether the session has the new process.
 function _start_claude!(agent::ClaudeCodeAgent, session::ClaudeSession)
     previous = session.process
     previous === nothing || isempty(previous.capabilities) || (session.capabilities = copy(previous.capabilities))
@@ -493,10 +494,16 @@ function _start_claude!(agent::ClaudeCodeAgent, session::ClaudeSession)
         throw(ACP.ProtocolException(ACP.INTERNAL_ERROR, "The program `$(first(agent.settings.claude_command))` " *
                                     "can not start: $(reason). Install Claude Code, or give its path."))
     end
+    ended = Pair{String,Any}[]
     is_closed = lock(session.lock) do
-        session.is_closed || (session.process = process; session.needs_restart = false)
+        if !session.is_closed
+            previous === nothing || (ended = end_running_tasks!(session.translation, "stopped"))
+            session.process = process
+            session.needs_restart = false
+        end
         session.is_closed
     end
+    _send_messages_quietly!(agent, ended)
     if is_closed
         close_claude_process!(process)
     else
@@ -655,17 +662,20 @@ end
 # `result` that ends its turn, or the end of the process, gives the prompt its
 # stop reason or its error. Between two prompts, each event goes to the editor at
 # once, so a turn that `claude` starts by itself, when a background task ends,
-# reaches the editor when it runs. The events of a process that the session no
-# longer has go nowhere.
+# reaches the editor when it runs. The end of the process ends the work that
+# still runs in it. The events of a process that the session no longer has go
+# nowhere.
 function _follow_claude!(agent::ClaudeCodeAgent, session::ClaudeSession, process::ClaudeProcess)
     while true
         event = take!(process.events)
+        is_exit = get(event, "type", nothing) == "process_exit"
         is_current, prompt_end = lock(() -> (session.process === process, session.prompt_end), session.lock)
+        is_current && is_exit && _end_claude_work!(agent, session, process)
         if is_current && prompt_end === nothing
-            _follow_event_between_prompts!(agent, session, event)
+            _follow_event_between_prompts!(agent, session, process, event)
         elseif is_current
             outcome = try
-                _follow_prompt_event!(agent, session, event)
+                _follow_prompt_event!(agent, session, process, event)
             catch exception
                 exception
             end
@@ -677,14 +687,27 @@ function _follow_claude!(agent::ClaudeCodeAgent, session::ClaudeSession, process
                 put!(prompt_end, outcome)
             end
         end
-        get(event, "type", nothing) == "process_exit" && return nothing
+        is_exit && return nothing
     end
+end
+
+# The subagents and the background tasks that still run in a `claude` that ends
+# end with it. A process that the agent closed or interrupted stopped them, and
+# one that ended by itself failed them. A closed session gets nothing.
+function _end_claude_work!(agent::ClaudeCodeAgent, session::ClaudeSession, process::ClaudeProcess)
+    status = process.is_closed || process.is_ending ? "stopped" : "failed"
+    messages = lock(session.lock) do
+        session.process === process && !session.is_closed ?
+            end_running_tasks!(session.translation, status) : Pair{String,Any}[]
+    end
+    _send_messages_quietly!(agent, messages)
 end
 
 # One event of `claude` while a prompt runs, sent to the editor. Answers the stop
 # reason of the prompt at its end, and `nothing` while it goes on; throws the
 # error of a turn that failed.
-function _follow_prompt_event!(agent::ClaudeCodeAgent, session::ClaudeSession, event::Dict{String,Any})
+function _follow_prompt_event!(agent::ClaudeCodeAgent, session::ClaudeSession, process::ClaudeProcess,
+                               event::Dict{String,Any})
     connection = agent.connection
     type = get(event, "type", nothing)
     if type == "process_exit"
@@ -708,7 +731,7 @@ function _follow_prompt_event!(agent::ClaudeCodeAgent, session::ClaudeSession, e
         end
         is_waiting || return _read_stop_reason(session, event)
     else
-        _send_event_updates!(session, event, connection)
+        _send_event_updates!(session, process, event, connection)
     end
     nothing
 end
@@ -716,7 +739,8 @@ end
 # One event of `claude` between two prompts, sent to the editor: a `result`
 # sends only the usage. An editor that is gone gets nothing, and an event that
 # fails leaves the reader for the next one.
-function _follow_event_between_prompts!(agent::ClaudeCodeAgent, session::ClaudeSession, event::Dict{String,Any})
+function _follow_event_between_prompts!(agent::ClaudeCodeAgent, session::ClaudeSession, process::ClaudeProcess,
+                                        event::Dict{String,Any})
     connection = agent.connection
     connection === nothing && return nothing
     type = get(event, "type", nothing)
@@ -726,7 +750,7 @@ function _follow_event_between_prompts!(agent::ClaudeCodeAgent, session::ClaudeS
         elseif type == "result"
             _send_usage!(session, event, connection)
         elseif !(type == "process_exit" || type == "user" && get(event, "isReplay", false) === true)
-            _send_event_updates!(session, event, connection)
+            _send_event_updates!(session, process, event, connection)
         end
     catch exception
         exception isa ACP.ProtocolException || exception isa Base.IOError ||
@@ -735,10 +759,19 @@ function _follow_event_between_prompts!(agent::ClaudeCodeAgent, session::ClaudeS
     nothing
 end
 
-# The updates of one event for the session and its subagents, and the
-# notifications of its background tasks.
-function _send_event_updates!(session::ClaudeSession, event::Dict{String,Any}, connection::ACP.Connection)
-    messages = lock(() -> translate_session_event!(session.translation, event), session.lock)
+# The updates of one event of `process` for the session and its subagents, and
+# the notifications of its background tasks. An event of a process that the
+# session no longer has gives none, so no work of it starts after its end.
+function _send_event_updates!(session::ClaudeSession, process::ClaudeProcess, event::Dict{String,Any},
+                              connection::ACP.Connection)
+    messages = lock(session.lock) do
+        session.process === process ? translate_session_event!(session.translation, event) : Pair{String,Any}[]
+    end
+    _send_messages!(connection, messages)
+end
+
+# The messages of the translation, as `session_id => message`, to the editor.
+function _send_messages!(connection::ACP.Connection, messages::Vector{Pair{String,Any}})
     for (session_id, message) in messages
         if message isa BackgroundTaskNotification
             ACP.send_notification!(connection, "_session/background_task", message.params)
@@ -746,6 +779,19 @@ function _send_event_updates!(session::ClaudeSession, event::Dict{String,Any}, c
             ACP.send_session_update!(connection, session_id, message)
         end
     end
+end
+
+# The messages of the translation to the editor of the agent, when it has one
+# that can take them.
+function _send_messages_quietly!(agent::ClaudeCodeAgent, messages::Vector{Pair{String,Any}})
+    connection = agent.connection
+    (connection === nothing || isempty(messages)) && return nothing
+    try
+        _send_messages!(connection, messages)
+    catch exception
+        exception isa ACP.ProtocolException || exception isa Base.IOError || rethrow()
+    end
+    nothing
 end
 
 # The commands and the mode of `system/init`, sent when they change.

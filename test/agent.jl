@@ -761,6 +761,39 @@ count_usage(client) = count(update -> update isa ACP.UsageUpdate, client.updates
         end
     end
 
+    @testset "the end of claude ends the subagents and the background tasks that still run" begin
+        subagent_start = only(event for event in read_recorded("subagent.jsonl")
+                              if get(event, "subtype", nothing) == "task_started")
+        task_start = first(event for event in read_recorded("background-task.jsonl")
+                           if get(event, "subtype", nothing) == "task_started")
+        work = [subagent_start, task_start]
+        turns = [vcat(work, make_result_turn("one")), vcat(work, [Dict{String,Any}("type" => "_exit")])]
+        client = TestClient()
+        test = open_test_agent(make_test_settings(turns); client, client_capabilities = make_all_capabilities())
+        session = open_test_session(test)
+        @test send_test_prompt(test, session.session_id, "Start work.").stop_reason == "end_turn"
+        # A restart for a new option stops the work of the claude before; the
+        # end of the new claude by itself fails its work.
+        ACP.send_request!(test.connection, ACP.SetSessionConfigOptionRequestValueId(
+            session_id = session.session_id, config_id = "model", value = "haiku"); timeout = 10)
+        failure = try
+            send_test_prompt(test, session.session_id, "Again.")
+        catch exception
+            exception
+        end
+        @test failure isa ACP.ProtocolException && failure.code == ACP.INTERNAL_ERROR
+        states = [last(update).state for update in client.session_updates if last(update) isa ACP.SubagentUpdate]
+        @test [typeof(state) for state in states] ==
+              [ACP.RunningStateUpdate, ACP.IdleStateUpdate, ACP.RunningStateUpdate, ACP.IdleStateUpdate]
+        @test [states[2].stop_reason, states[4].stop_reason] == ["cancelled", "cancelled"]
+        tasks = [last(notification) for notification in client.notifications]
+        @test [(params["taskId"], params["status"], params["canStop"]) for params in tasks] ==
+              [("byowkisnu", "running", true), ("byowkisnu", "stopped", false),
+               ("byowkisnu", "running", true), ("byowkisnu", "failed", false)]
+        @test tasks[2]["endTime"] isa Integer && tasks[4]["endTime"] isa Integer
+        close_test_agent(test)
+    end
+
     @testset "the process id of claude goes to the client once for each process" begin
         test = open_test_agent(make_test_settings([make_result_turn("one"), make_result_turn("two"),
                                                    make_result_turn("three")]; process_id = 2^30))

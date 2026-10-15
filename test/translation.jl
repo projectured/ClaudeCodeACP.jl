@@ -1,7 +1,7 @@
 # The translation of single stream events, without a process.
 
 using ClaudeCodeACP: TurnState, translate_event!, format_tool_title, get_tool_kind, ClientFeatures,
-                     SessionTranslation, translate_session_event!
+                     SessionTranslation, translate_session_event!, end_running_tasks!
 
 tool_use(name, input; id = "t1") = Dict{String,Any}("type" => "assistant", "parent_tool_use_id" => nothing,
     "message" => Dict{String,Any}("content" => Any[Dict{String,Any}("type" => "tool_use", "id" => id,
@@ -173,5 +173,29 @@ make_subagent_start(task_id, call_id) = system_event("task_started"; task_id, to
         plain = SessionTranslation("s")
         @test isempty(translate_session_event!(plain, make_subagent_start("outer", "call-outer")))
         @test isempty(translate_session_event!(plain, text))
+    end
+
+    @testset "a background task names the subagent that started it, and the end of claude ends the work" begin
+        translation = SessionTranslation("s"; features = ClientFeatures(subagents = true, background_tasks = true))
+        translate_session_event!(translation, tool_use("Agent", Dict{String,Any}(); id = "call-agent"))
+        translate_session_event!(translation, make_subagent_start("helper", "call-agent"))
+        command = tool_use("Bash", Dict{String,Any}("command" => "sleep 9", "run_in_background" => true); id = "call-bash")
+        command["parent_tool_use_id"] = "call-agent"
+        translate_session_event!(translation, command)
+        start_task(task_id, call_id) = last(only(translate_session_event!(translation, system_event("task_started";
+            task_id, tool_use_id = call_id, task_type = "local_bash", description = "Sleep"))))
+        params = start_task("b1", "call-bash").params
+        @test (params["sessionId"], params["subagentId"], params["status"]) == ("s", "helper", "running")
+        # A task whose call no subagent made names none.
+        @test !haskey(start_task("b2", "call-other").params, "subagentId")
+        messages = end_running_tasks!(translation, "failed")
+        idle = only(last(message) for message in messages if last(message) isa ACP.SubagentUpdate)
+        @test (idle.session_id, idle.state.stop_reason) == ("helper", "cancelled")
+        ended = sort([last(message).params for message in messages if !(last(message) isa ACP.SubagentUpdate)];
+                     by = params -> params["taskId"])
+        @test [(params["taskId"], params["status"], params["canStop"]) for params in ended] ==
+              [("b1", "failed", false), ("b2", "failed", false)]
+        @test all(params["endTime"] isa Integer for params in ended)
+        @test isempty(end_running_tasks!(translation, "stopped"))
     end
 end

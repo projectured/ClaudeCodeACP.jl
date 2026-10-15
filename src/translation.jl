@@ -440,9 +440,9 @@ end
 Work that `claude` started and that runs after the call that started it, such as
 a command with `run_in_background`: its task id, its kind (the `task_type` of
 `claude`), its title, its status (`running`, `completed`, `failed` or
-`stopped`), the id of the tool call that started it, the `file://` uri of its
-output, its summary, and the times of its start and its end in milliseconds
-since 1970.
+`stopped`), the id of the tool call that started it, the task id of the
+subagent that made that call, the `file://` uri of its output, its summary, and
+the times of its start and its end in milliseconds since 1970.
 """
 mutable struct BackgroundTask
     task_id::String
@@ -450,6 +450,7 @@ mutable struct BackgroundTask
     title::String
     status::String
     tool_call_id::Union{Nothing,String}
+    subagent_id::Union{Nothing,String}
     output_uri::Union{Nothing,String}
     summary::Union{Nothing,String}
     start_time::Int
@@ -525,9 +526,10 @@ function _translate_system_event!(messages, translation::SessionTranslation, eve
         if get(event, "task_type", nothing) == "local_agent"
             features.subagents && _start_subagent!(messages, translation, task_id, event)
         else
+            tool_use_id = _get_text(event, "tool_use_id")
             task = BackgroundTask(task_id, string(get(event, "task_type", "")), string(get(event, "description", "")),
-                                  "running", _get_text(event, "tool_use_id"), nothing, nothing,
-                                  _read_time(get(event, "start_time", nothing)), nothing)
+                                  "running", tool_use_id, _find_subagent_id(translation, tool_use_id), nothing,
+                                  nothing, _read_time(get(event, "start_time", nothing)), nothing)
             translation.background_tasks[task_id] = task
             _push_background_task!(messages, translation, task)
         end
@@ -562,9 +564,7 @@ end
 # as the message of the user.
 function _start_subagent!(messages, translation::SessionTranslation, task_id::String, event::Dict{String,Any})
     tool_use_id = _get_text(event, "tool_use_id")
-    parent = tool_use_id === nothing ? nothing :
-             findfirst(subagent -> haskey(subagent.state.tool_calls, tool_use_id), translation.subagents)
-    parent_id = something(parent, translation.session_id)
+    parent_id = something(_find_subagent_id(translation, tool_use_id), translation.session_id)
     translation.subagents[task_id] = Subagent(task_id, parent_id,
         TurnState(features = translation.state.features, has_stream_events = false), Dict{String,Any}(), false)
     tool_use_id === nothing || (translation.subagent_ids[tool_use_id] = task_id)
@@ -575,6 +575,37 @@ function _start_subagent!(messages, translation::SessionTranslation, task_id::St
     prompt = _get_text(event, "prompt")
     prompt === nothing || push!(messages, task_id => ACP.UserMessageChunk(content = ACP.TextContent(text = prompt)))
     nothing
+end
+
+# The task id of the subagent whose message holds the tool call `tool_use_id`,
+# or `nothing` for a call of the session and for a call that no event named.
+_find_subagent_id(translation::SessionTranslation, tool_use_id) = tool_use_id === nothing ? nothing :
+    findfirst(subagent -> haskey(subagent.state.tool_calls, tool_use_id), translation.subagents)
+
+"""
+    end_running_tasks!(translation, status) -> Vector{Pair{String,Any}}
+
+The messages that end the work that still runs when the `claude` that holds it
+ends, as [`translate_session_event!`](@ref) gives them: each subagent that runs
+goes idle with the stop reason `cancelled`, and each background task that runs
+gets the status `status`, `stopped` or `failed`, and its end time. Each goes only
+to a client that takes it.
+"""
+function end_running_tasks!(translation::SessionTranslation, status::String)
+    messages = Pair{String,Any}[]
+    for subagent in values(translation.subagents)
+        subagent.is_idle && continue
+        subagent.is_idle = true
+        push!(messages, subagent.parent_id => ACP.SubagentUpdate(
+            session_id = subagent.task_id, state = ACP.IdleStateUpdate(stop_reason = "cancelled")))
+    end
+    for task in values(translation.background_tasks)
+        task.status == "running" || continue
+        task.status = status
+        task.end_time = something(task.end_time, _read_time(nothing))
+        _push_background_task!(messages, translation, task)
+    end
+    messages
 end
 
 # A progress keeps the subagent running; the end of its task, from
@@ -655,6 +686,7 @@ function _push_background_task!(messages, translation::SessionTranslation, task:
                               "title" => task.title, "status" => task.status, "startTime" => task.start_time,
                               "canStop" => task.status == "running")
     task.tool_call_id === nothing || (params["toolCallId"] = task.tool_call_id)
+    task.subagent_id === nothing || (params["subagentId"] = task.subagent_id)
     task.output_uri === nothing || (params["outputUri"] = task.output_uri)
     task.summary === nothing || (params["summary"] = task.summary)
     task.end_time === nothing || (params["endTime"] = task.end_time)

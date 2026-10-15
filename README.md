@@ -14,7 +14,7 @@ into the updates of the session:
 
 - the text of the answer and the summary of the thinking, as they stream;
 - each tool call, with its title, its kind, its file, and a diff for an edit;
-- the plan, from the task list of Claude Code;
+- the plan, from the task list and the to-do list of Claude Code;
 - the commands, the usage of the context and the cost estimate;
 - the title of a new session, from its first prompt. A resumed session gets no
   new title, so the editor keeps the title that it has.
@@ -42,6 +42,57 @@ names the sign-in `claude-login`, which runs `claude-code-acp --login`. An edito
 that runs the agent in its own process runs `make_login_command()` for it. The ACP
 request `logout` runs `claude auth logout`, and the next prompt of each session
 then asks for a sign-in.
+
+## The work of Claude
+
+Some parts of ACP are not stable yet. The agent sends each of them only to an
+editor that advertises it in `initialize`.
+
+- **Subagents** (`clientCapabilities.subagents`). Each subagent of Claude is a
+  child session. The agent announces it on its parent session with
+  `subagent_update`. The session id of the child is the task id of the subagent
+  in Claude Code. The prompt of the subagent comes as a user message of the
+  child session. Its text, its thinking and its tool calls come in the child
+  session. Its progress keeps it running, and its end makes it idle. A
+  `session/cancel` of the child session stops the subagent.
+- **Plans** (`clientCapabilities.plan`). A plan has an id. The steps of the
+  task tools and of `TodoWrite` come as `plan_update` of the type `items`, with
+  the id `tasks`. The plan of the plan mode comes as `plan_update` of the type
+  `markdown`, with the id `plan-mode`. Another editor gets the steps as the
+  `plan` of ACP version 1.
+- **Notices** (`clientCapabilities.session.notices`). A retry of a request to
+  the API comes as a notice. A fallback to another model comes as a notice.
+- **Compactions** (`clientCapabilities.session.compaction`). A compaction of
+  the conversation comes as `compaction_update`.
+- **Background tasks** (an object at `clientCapabilities._meta.backgroundTasks`).
+  A background task is work that runs after the call that started it, such as
+  a command with `run_in_background`. The agent advertises
+  `_meta.backgroundTasks.supported`. Each change of a background task comes in
+  the extension notification `_session/background_task`. Its params are
+  `sessionId`, `taskId`, `kind`, `title`, `status`, `startTime` and `canStop`,
+  and, when they are known, `toolCallId`, `subagentId`, `outputUri`, `summary`
+  and `endTime`. The status is `running`, `completed`, `failed` or `stopped`.
+  The times are milliseconds since 1970. The extension request
+  `_session/stop_background_task`, with `sessionId` and `taskId`, stops a task
+  that runs.
+
+The `_meta.claudeCode` of an entry of the plan holds `taskId`, `description`,
+`activeForm` and `blockedBy`, the ids of the steps that block it. The
+`_meta.claudeCode` of a `subagent_update` holds `usage` (`totalTokens`,
+`toolUses` and `durationMs`), `lastToolName` and `summary`. Each holds only the
+keys that Claude Code gives.
+
+When `claude` ends or starts again for a new option, the work that runs in it
+ends too. Each subagent that runs becomes idle, with the stop reason
+`cancelled`. Each background task that runs gets the status `stopped`, or
+`failed` when `claude` ended by itself.
+
+The first prompt after each start of `claude` sends a `session_info_update`
+whose `_meta.processId` is the process id of that `claude`.
+
+The agent reads what `claude` writes also between two prompts. When a
+background task ends after a turn, `claude` starts a turn by itself. That turn
+reaches the editor at once, as updates of the session.
 
 ## Install
 
