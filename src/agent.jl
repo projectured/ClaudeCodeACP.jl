@@ -39,6 +39,8 @@ messages that went to `claude` for it, `taken_messages` the ones that `claude`
 echoed when a turn took them, `is_steerable` says that a message can still go
 into it, and `prompt_end` takes its stop reason or its error from the reader of
 the events. `reported_process` is the process whose id went to the editor.
+`send_lock` keeps the messages of the translation in their order; a task that
+holds it may take `lock`, and never the other way round.
 """
 mutable struct ClaudeSession
     id::String
@@ -67,6 +69,7 @@ mutable struct ClaudeSession
     reported_process::Union{Nothing,ClaudeProcess}
     waiting_permissions::Vector{ACP.OutgoingRequest}
     lock::ReentrantLock
+    send_lock::ReentrantLock
 end
 
 """
@@ -456,7 +459,7 @@ function _open_session!(agent::ClaudeCodeAgent, id::String, directory::String, m
                             Dict(option.id => "default" for option in SESSION_OPTIONS), Set{String}(),
                             nothing, String[], has_history, false, nothing, String[], Set{String}(),
                             SessionTranslation(id; features = agent.features), false, false, false, 0, 0, false,
-                            nothing, nothing, ACP.OutgoingRequest[], ReentrantLock())
+                            nothing, nothing, ACP.OutgoingRequest[], ReentrantLock(), ReentrantLock())
     is_open = lock(agent.lock) do
         haskey(agent.sessions, id) || (agent.sessions[id] = session; return false)
         true
@@ -494,16 +497,19 @@ function _start_claude!(agent::ClaudeCodeAgent, session::ClaudeSession)
         throw(ACP.ProtocolException(ACP.INTERNAL_ERROR, "The program `$(first(agent.settings.claude_command))` " *
                                     "can not start: $(reason). Install Claude Code, or give its path."))
     end
-    ended = Pair{String,Any}[]
-    is_closed = lock(session.lock) do
-        if !session.is_closed
-            previous === nothing || (ended = end_running_tasks!(session.translation, "stopped"))
-            session.process = process
-            session.needs_restart = false
+    is_closed = lock(session.send_lock) do
+        ended = Pair{String,Any}[]
+        is_closed = lock(session.lock) do
+            if !session.is_closed
+                previous === nothing || (ended = end_running_tasks!(session.translation, "stopped"))
+                session.process = process
+                session.needs_restart = false
+            end
+            session.is_closed
         end
-        session.is_closed
+        _send_messages_quietly!(agent, ended)
+        is_closed
     end
-    _send_messages_quietly!(agent, ended)
     if is_closed
         close_claude_process!(process)
     else
@@ -588,6 +594,12 @@ end
 
 # --- A prompt ----------------------------------------------------------------
 
+# The error of a `result` that ends a prompt: `claude` is ready for the next
+# message after it.
+struct FailedTurn
+    exception::ACP.ProtocolException
+end
+
 function ACP.answer_request(agent::ClaudeCodeAgent, request::ACP.PromptRequest, context)
     session = _get_session(agent, request.session_id)
     lock(session.lock) do
@@ -597,11 +609,19 @@ function ACP.answer_request(agent::ClaudeCodeAgent, request::ACP.PromptRequest, 
         session.is_cancelled = false
     end
     connection = context.connection
+    is_sent = false
+    is_failed_turn = false
     try
         content = _make_claude_content(request.prompt)
         process = session.process
         if process === nothing || session.needs_restart || !is_claude_running(process)
-            process === nothing || close_claude_process!(process)
+            if process !== nothing
+                # The work of a `claude` that ended by itself failed; the work
+                # of one that the agent ends stops.
+                status = process.is_closed || process.is_ending || is_claude_running(process) ? "stopped" : "failed"
+                _end_claude_work!(agent, session, process, status)
+                close_claude_process!(process)
+            end
             _require_sign_in(agent)
             _start_claude!(agent, session)
         end
@@ -615,7 +635,7 @@ function ACP.answer_request(agent::ClaudeCodeAgent, request::ACP.PromptRequest, 
             session.title === nothing ||
                 ACP.send_session_update!(connection, session.id, ACP.SessionInfoUpdate(title = session.title))
         end
-        _send_process_id!(session, connection)
+        agent.features.background_tasks && _send_process_id!(session, connection)
         # The reader of the events gives the prompt its end. A `claude` that
         # ended before the message went to it gives no events any more.
         prompt_end = Channel{Any}(1)
@@ -628,13 +648,20 @@ function ACP.answer_request(agent::ClaudeCodeAgent, request::ACP.PromptRequest, 
             session.is_steerable = true
             session.prompt_end = prompt_end
         end
+        is_sent = true
         session.has_history = true
         outcome = take!(prompt_end)
+        if outcome isa FailedTurn
+            is_failed_turn = true
+            throw(outcome.exception)
+        end
         outcome isa Exception && throw(outcome)
         ACP.PromptResponse(stop_reason = outcome)
     catch
-        # The events of a turn that failed must not reach the next prompt.
-        session.needs_restart = true
+        # A failure after the message went to `claude`, but for the error of a
+        # `result`, leaves `claude` in a state that the agent does not know, so
+        # the next prompt starts it again.
+        is_sent && !is_failed_turn && (session.needs_restart = true)
         rethrow()
     finally
         lock(session.lock) do
@@ -659,30 +686,31 @@ end
 
 # The reader of the events of the `claude` of a session, in their order, for as
 # long as the process runs. While a prompt runs, each event goes to it, and the
-# `result` that ends its turn, or the end of the process, gives the prompt its
-# stop reason or its error. Between two prompts, each event goes to the editor at
-# once, so a turn that `claude` starts by itself, when a background task ends,
-# reaches the editor when it runs. The end of the process ends the work that
-# still runs in it. The events of a process that the session no longer has go
-# nowhere.
+# event that ends its turn gives the prompt its stop reason or its error.
+# Between two prompts, each event goes to the editor at once, so a turn that
+# `claude` starts by itself, when a background task ends, reaches the editor
+# when it runs; an event that fails then leaves the reader for the next one. The
+# end of the process ends the work that still runs in it. The events of a
+# process that the session no longer has go nowhere.
 function _follow_claude!(agent::ClaudeCodeAgent, session::ClaudeSession, process::ClaudeProcess)
     while true
         event = take!(process.events)
         is_exit = get(event, "type", nothing) == "process_exit"
         is_current, prompt_end = lock(() -> (session.process === process, session.prompt_end), session.lock)
-        is_current && is_exit && _end_claude_work!(agent, session, process)
-        if is_current && prompt_end === nothing
-            _follow_event_between_prompts!(agent, session, process, event)
-        elseif is_current
+        if is_current
+            is_exit && _end_claude_work!(agent, session, process,
+                                         process.is_closed || process.is_ending ? "stopped" : "failed")
             outcome = try
-                _follow_prompt_event!(agent, session, process, event)
+                _follow_event!(agent, session, process, event, prompt_end !== nothing)
             catch exception
-                exception
+                prompt_end === nothing && !(exception isa ACP.ProtocolException || exception isa Base.IOError) &&
+                    @warn "An event of claude between two prompts failed." exception
+                prompt_end === nothing ? nothing : exception
             end
             if outcome !== nothing
                 lock(session.lock) do
                     session.prompt_end = nothing
-                    empty!(session.translation.state.tool_calls)
+                    session.is_steerable = false
                 end
                 put!(prompt_end, outcome)
             end
@@ -691,26 +719,20 @@ function _follow_claude!(agent::ClaudeCodeAgent, session::ClaudeSession, process
     end
 end
 
-# The subagents and the background tasks that still run in a `claude` that ends
-# end with it. A process that the agent closed or interrupted stopped them, and
-# one that ended by itself failed them. A closed session gets nothing.
-function _end_claude_work!(agent::ClaudeCodeAgent, session::ClaudeSession, process::ClaudeProcess)
-    status = process.is_closed || process.is_ending ? "stopped" : "failed"
-    messages = lock(session.lock) do
-        session.process === process && !session.is_closed ?
-            end_running_tasks!(session.translation, status) : Pair{String,Any}[]
-    end
-    _send_messages_quietly!(agent, messages)
-end
-
-# One event of `claude` while a prompt runs, sent to the editor. Answers the stop
-# reason of the prompt at its end, and `nothing` while it goes on; throws the
-# error of a turn that failed.
-function _follow_prompt_event!(agent::ClaudeCodeAgent, session::ClaudeSession, process::ClaudeProcess,
-                               event::Dict{String,Any})
+# One event of `claude`, sent to the editor, while a prompt runs or between two
+# prompts. Answers the end of the prompt when the event ends it: its stop
+# reason, or the `FailedTurn` of a `result` that failed; and `nothing` else.
+# Throws the error of a process that ended in a prompt. A `result` ends the
+# prompt when the prompt is cancelled or `claude` took each of its messages;
+# another one ends a turn that `claude` started by itself, and sends only the
+# usage, as a `result` between two prompts does.
+function _follow_event!(agent::ClaudeCodeAgent, session::ClaudeSession, process::ClaudeProcess,
+                        event::Dict{String,Any}, is_prompting::Bool)
     connection = agent.connection
+    (is_prompting || connection !== nothing) || return nothing
     type = get(event, "type", nothing)
     if type == "process_exit"
+        is_prompting || return nothing
         session.needs_restart = true
         lock(() -> session.is_cancelled, session.lock) && return "cancelled"
         throw(ACP.ProtocolException(ACP.INTERNAL_ERROR, "Claude Code ended before the end of the turn."))
@@ -718,56 +740,52 @@ function _follow_prompt_event!(agent::ClaudeCodeAgent, session::ClaudeSession, p
         _read_init!(session, event, connection)
     elseif type == "user" && get(event, "isReplay", false) === true
         # Claude Code echoes each user message when a turn takes it.
-        lock(() -> session.taken_messages += 1, session.lock)
+        is_prompting && lock(() -> session.taken_messages += 1, session.lock)
     elseif type == "result"
         _send_usage!(session, event, connection)
-        # A message that came after the last call of the model of the turn
-        # starts a turn of its own after this result, and the prompt goes on
-        # with it. The last result also ends the steering of the prompt.
-        is_waiting = lock(session.lock) do
-            is_waiting = session.taken_messages < session.sent_messages && get(event, "is_error", false) !== true
-            is_waiting || (session.is_steerable = false)
-            is_waiting
+        lock(() -> empty!(session.translation.state.tool_calls), session.lock)
+        is_prompting || return nothing
+        is_ending = lock(() -> session.is_cancelled || session.taken_messages >= session.sent_messages, session.lock)
+        is_ending || return nothing
+        return try
+            _read_stop_reason(session, event)
+        catch exception
+            exception isa ACP.ProtocolException || rethrow()
+            FailedTurn(exception)
         end
-        is_waiting || return _read_stop_reason(session, event)
     else
         _send_event_updates!(session, process, event, connection)
     end
     nothing
 end
 
-# One event of `claude` between two prompts, sent to the editor: a `result`
-# sends only the usage. An editor that is gone gets nothing, and an event that
-# fails leaves the reader for the next one.
-function _follow_event_between_prompts!(agent::ClaudeCodeAgent, session::ClaudeSession, process::ClaudeProcess,
-                                        event::Dict{String,Any})
-    connection = agent.connection
-    connection === nothing && return nothing
-    type = get(event, "type", nothing)
-    try
-        if type == "system" && get(event, "subtype", nothing) == "init"
-            _read_init!(session, event, connection)
-        elseif type == "result"
-            _send_usage!(session, event, connection)
-        elseif !(type == "process_exit" || type == "user" && get(event, "isReplay", false) === true)
-            _send_event_updates!(session, process, event, connection)
+# The subagents and the background tasks that still run in a `claude` that ends
+# end with it, with the status `status` of a background task: `stopped` when the
+# agent ends it, and `failed` when it ended by itself. A closed session gets
+# nothing.
+function _end_claude_work!(agent::ClaudeCodeAgent, session::ClaudeSession, process::ClaudeProcess, status::String)
+    lock(session.send_lock) do
+        messages = lock(session.lock) do
+            session.process === process && !session.is_closed ?
+                end_running_tasks!(session.translation, status) : Pair{String,Any}[]
         end
-    catch exception
-        exception isa ACP.ProtocolException || exception isa Base.IOError ||
-            @warn "An event of claude between two prompts failed." exception
+        _send_messages_quietly!(agent, messages)
     end
-    nothing
 end
 
 # The updates of one event of `process` for the session and its subagents, and
 # the notifications of its background tasks. An event of a process that the
-# session no longer has gives none, so no work of it starts after its end.
+# session no longer has gives none, so no work of it starts after its end. The
+# send lock keeps the messages in the order of their translation, also against
+# the end of the work at a start of `claude`.
 function _send_event_updates!(session::ClaudeSession, process::ClaudeProcess, event::Dict{String,Any},
                               connection::ACP.Connection)
-    messages = lock(session.lock) do
-        session.process === process ? translate_session_event!(session.translation, event) : Pair{String,Any}[]
+    lock(session.send_lock) do
+        messages = lock(session.lock) do
+            session.process === process ? translate_session_event!(session.translation, event) : Pair{String,Any}[]
+        end
+        _send_messages!(connection, messages)
     end
-    _send_messages!(connection, messages)
 end
 
 # The messages of the translation, as `session_id => message`, to the editor.
@@ -918,7 +936,8 @@ end
 # --- A cancel ----------------------------------------------------------------
 
 # A cancel of the child session of a subagent stops that subagent with the
-# control request `stop_task`, and the prompt of its session goes on.
+# control request `stop_task`, and the prompt of its session goes on. A stop
+# that `claude` refuses is logged.
 function ACP.receive_notification(agent::ClaudeCodeAgent, notification::ACP.CancelNotification, connection)
     session = lock(() -> get(agent.sessions, notification.session_id, nothing), agent.lock)
     session === nothing && return _stop_subagent!(agent, notification.session_id)
@@ -933,14 +952,17 @@ function ACP.receive_notification(agent::ClaudeCodeAgent, notification::ACP.Canc
     nothing
 end
 
-# Stop the subagent whose child session has the id `task_id`, when it runs.
+# Stop the subagent whose child session has the id `task_id`, when it runs. A
+# notification must not wait, so a task of its own waits for the answer.
 function _stop_subagent!(agent::ClaudeCodeAgent, task_id::AbstractString)
     for session in lock(() -> collect(values(agent.sessions)), agent.lock)
-        process = lock(session.lock) do
-            subagent = get(session.translation.subagents, task_id, nothing)
-            subagent === nothing || subagent.is_idle ? nothing : session.process
-        end
-        process === nothing || return stop_claude_task!(process, task_id)
+        process = lock(() -> haskey(session.translation.subagents, task_id) ? session.process : nothing, session.lock)
+        process === nothing && continue
+        errormonitor(@async begin
+            reason = stop_claude_task!(process, task_id)
+            reason === nothing || @warn "Claude Code did not stop a subagent." task_id reason
+        end)
+        return nothing
     end
     nothing
 end
@@ -961,7 +983,9 @@ ends after the turn that takes it. The answer is the outcome `injected`, or
 The extension method `_session/stop_background_task`: `params` are
 `{sessionId, taskId}`, for a background task that runs, as the notification
 `_session/background_task` names it. `claude` gets the control request
-`stop_task`, and the answer is an empty object.
+`stop_task`, and the answer is an empty object when `claude` answers that it
+stopped the task. An error answers a task that does not run, and a stop that
+`claude` refuses or does not answer in ten seconds.
 """
 function ACP.answer_request(agent::ClaudeCodeAgent, method::String, params, context)
     method == "_session/stop_background_task" && return _stop_background_task!(agent, params)
@@ -995,7 +1019,8 @@ function _stop_background_task!(agent::ClaudeCodeAgent, params)
     end
     process === nothing && throw(ACP.ProtocolException(ACP.INVALID_PARAMS,
                                                        "No background task `$(task_id)` runs in this session."))
-    stop_claude_task!(process, task_id)
+    reason = stop_claude_task!(process, task_id)
+    reason === nothing || throw(ACP.ProtocolException(ACP.INTERNAL_ERROR, reason))
     Dict{String,Any}()
 end
 
@@ -1011,7 +1036,6 @@ prompt, a call after a cancel, and a question without an answer are denied.
 """
 function decide_permission!(agent::ClaudeCodeAgent, session::ClaudeSession, tool_name::String,
                             input::Dict{String,Any}, tool_use_id::String)
-    tool_name == "ExitPlanMode" && _send_plan_mode!(agent, session, input)
     state = lock(session.lock) do
         (session.is_cancelled || !session.is_prompting) ? :refused :
         tool_name in session.always_allowed ? :allowed : :asked
@@ -1022,6 +1046,7 @@ function decide_permission!(agent::ClaudeCodeAgent, session::ClaudeSession, tool
     state === :allowed && return _make_allow_decision(input)
     connection = agent.connection
     connection === nothing && return _make_deny_decision("No editor is connected, so nobody can allow this call.")
+    tool_name == "ExitPlanMode" && _send_plan_mode!(connection, session, input, tool_use_id)
     tool_call = ACP.ToolCallUpdate(tool_call_id = tool_use_id, title = format_tool_title(tool_name, input),
                                    name = tool_name, kind = get_tool_kind(tool_name), status = "pending",
                                    raw_input = input)
@@ -1062,14 +1087,20 @@ end
 _make_allow_decision(input::Dict{String,Any}) = Dict{String,Any}("behavior" => "allow", "updatedInput" => input)
 
 # The plan of the plan mode, which only the question for `ExitPlanMode` holds,
-# goes to an editor that takes plans with an id, before the question.
-function _send_plan_mode!(agent::ClaudeCodeAgent, session::ClaudeSession, input::Dict{String,Any})
-    connection = agent.connection
-    connection === nothing && return nothing
-    update = lock(() -> make_plan_mode_update!(session.translation.state, get(input, "plan", nothing)), session.lock)
+# goes to an editor that takes plans with an id, before the question: in the
+# session, or in the child session of the subagent that made the call.
+function _send_plan_mode!(connection::ACP.Connection, session::ClaudeSession, input::Dict{String,Any},
+                          tool_use_id::String)
+    session_id, update = lock(session.lock) do
+        translation = session.translation
+        subagent_id = _find_subagent_id(translation, tool_use_id)
+        subagent = subagent_id === nothing ? nothing : translation.subagents[subagent_id]
+        (subagent === nothing ? session.id : subagent_id,
+         make_plan_mode_update!(subagent === nothing ? translation.state : subagent.state, get(input, "plan", nothing)))
+    end
     update === nothing && return nothing
     try
-        ACP.send_session_update!(connection, session.id, update)
+        ACP.send_session_update!(connection, session_id, update)
     catch exception
         exception isa ACP.ProtocolException || exception isa Base.IOError || rethrow()
     end

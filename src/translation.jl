@@ -421,17 +421,16 @@ end
 """
     Subagent
 
-A subagent of a session, as a child session of ACP: its task id, which is also
-the session id of the child, the session id of its parent, the translation of
-its messages, the fields of `_meta.claudeCode` of its updates, and whether its
-idle state went to the client.
+A subagent of a session that runs, as a child session of ACP: its task id, which
+is also the session id of the child, the session id of its parent, the
+translation of its messages, and the fields of `_meta.claudeCode` of its
+updates.
 """
 mutable struct Subagent
     task_id::String
     parent_id::String
     state::TurnState
     fields::Dict{String,Any}
-    is_idle::Bool
 end
 
 """
@@ -441,8 +440,9 @@ Work that `claude` started and that runs after the call that started it, such as
 a command with `run_in_background`: its task id, its kind (the `task_type` of
 `claude`), its title, its status (`running`, `completed`, `failed` or
 `stopped`), the id of the tool call that started it, the task id of the
-subagent that made that call, the `file://` uri of its output, its summary, and
-the times of its start and its end in milliseconds since 1970.
+subagent that made that call, the `file://` uri of its output, its summary, the
+times of its start and its end in milliseconds since 1970, and the params of
+`_session/background_task` that went to the client last.
 """
 mutable struct BackgroundTask
     task_id::String
@@ -455,13 +455,15 @@ mutable struct BackgroundTask
     summary::Union{Nothing,String}
     start_time::Int
     end_time::Union{Nothing,Int}
+    sent::Dict{String,Any}
 end
 
 """
     BackgroundTaskNotification
 
 The extension notification `_session/background_task` with its `params`: the
-whole state of one background task.
+`sessionId` and the `taskId` of one background task, and the keys of its state
+that changed since its last notification, which are all of them in its first.
 """
 struct BackgroundTaskNotification
     params::Dict{String,Any}
@@ -471,21 +473,24 @@ end
     SessionTranslation(session_id; features = ClientFeatures())
 
 What the translation keeps for one session: its id, the translation of its own
-messages, its subagents by their task id, the task id of each subagent by the
-id of the `Agent` call that started it, and its background tasks by their task
-id.
+messages, its subagents that run by their task id, the task id of each of them
+by the id of the `Agent` call that started it, the session id of the parent of
+each subagent that ended, by its task id, and its background tasks by their
+task id until their last notification. A subagent or a background task that
+ended keeps nothing else, and the end of its `claude` forgets it all.
 """
 mutable struct SessionTranslation
     session_id::String
     state::TurnState
     subagents::Dict{String,Subagent}
     subagent_ids::Dict{String,String}
+    ended_subagents::Dict{String,String}
     background_tasks::Dict{String,BackgroundTask}
 end
 
 SessionTranslation(session_id::String; features::ClientFeatures = ClientFeatures()) =
     SessionTranslation(session_id, TurnState(; features), Dict{String,Subagent}(), Dict{String,String}(),
-                       Dict{String,BackgroundTask}())
+                       Dict{String,String}(), Dict{String,BackgroundTask}())
 
 """
     translate_session_event!(translation, event) -> Vector{Pair{String,Any}}
@@ -524,18 +529,25 @@ function _translate_system_event!(messages, translation::SessionTranslation, eve
     task_id = string(get(event, "task_id", ""))
     if subtype == "task_started" && !isempty(task_id)
         if get(event, "task_type", nothing) == "local_agent"
-            features.subagents && _start_subagent!(messages, translation, task_id, event)
-        else
+            features.subagents && !haskey(translation.ended_subagents, task_id) &&
+                _start_subagent!(messages, translation, task_id, event)
+        elseif features.background_tasks
             tool_use_id = _get_text(event, "tool_use_id")
             task = BackgroundTask(task_id, string(get(event, "task_type", "")), string(get(event, "description", "")),
                                   "running", tool_use_id, _find_subagent_id(translation, tool_use_id), nothing,
-                                  nothing, _read_time(get(event, "start_time", nothing)), nothing)
+                                  nothing, _read_time(get(event, "start_time", nothing)), nothing, Dict{String,Any}())
             translation.background_tasks[task_id] = task
             _push_background_task!(messages, translation, task)
         end
     elseif subtype in ("task_progress", "task_updated", "task_notification")
         if haskey(translation.subagents, task_id)
-            _update_subagent!(messages, translation.subagents[task_id], subtype, event)
+            _update_subagent!(messages, translation, translation.subagents[task_id], subtype, event)
+        elseif haskey(translation.ended_subagents, task_id)
+            # A late event of a subagent that ended gives only its new usage
+            # and summary.
+            fields = Dict{String,Any}()
+            _read_task_fields!(fields, event) && push!(messages, translation.ended_subagents[task_id] =>
+                ACP.SubagentUpdate(session_id = task_id, meta = Dict{String,Any}("claudeCode" => fields)))
         elseif haskey(translation.background_tasks, task_id)
             _update_background_task!(messages, translation, translation.background_tasks[task_id], subtype, event)
         end
@@ -566,7 +578,7 @@ function _start_subagent!(messages, translation::SessionTranslation, task_id::St
     tool_use_id = _get_text(event, "tool_use_id")
     parent_id = something(_find_subagent_id(translation, tool_use_id), translation.session_id)
     translation.subagents[task_id] = Subagent(task_id, parent_id,
-        TurnState(features = translation.state.features, has_stream_events = false), Dict{String,Any}(), false)
+        TurnState(features = translation.state.features, has_stream_events = false), Dict{String,Any}())
     tool_use_id === nothing || (translation.subagent_ids[tool_use_id] = task_id)
     push!(messages, parent_id => ACP.SubagentUpdate(
         session_id = task_id, title = _get_text(event, "description"), description = _get_text(event, "subagent_type"),
@@ -589,13 +601,12 @@ The messages that end the work that still runs when the `claude` that holds it
 ends, as [`translate_session_event!`](@ref) gives them: each subagent that runs
 goes idle with the stop reason `cancelled`, and each background task that runs
 gets the status `status`, `stopped` or `failed`, and its end time. Each goes only
-to a client that takes it.
+to a client that takes it. The translation then forgets the subagents and the
+background tasks of that `claude`.
 """
 function end_running_tasks!(translation::SessionTranslation, status::String)
     messages = Pair{String,Any}[]
     for subagent in values(translation.subagents)
-        subagent.is_idle && continue
-        subagent.is_idle = true
         push!(messages, subagent.parent_id => ACP.SubagentUpdate(
             session_id = subagent.task_id, state = ACP.IdleStateUpdate(stop_reason = "cancelled")))
     end
@@ -605,24 +616,32 @@ function end_running_tasks!(translation::SessionTranslation, status::String)
         task.end_time = something(task.end_time, _read_time(nothing))
         _push_background_task!(messages, translation, task)
     end
+    empty!(translation.subagents)
+    empty!(translation.subagent_ids)
+    empty!(translation.ended_subagents)
+    empty!(translation.background_tasks)
     messages
 end
 
 # A progress keeps the subagent running; the end of its task, from
-# `task_updated` or `task_notification`, makes it idle, once. The usage, the last
-# tool and the summary go in `_meta.claudeCode`, each update with all of them.
-function _update_subagent!(messages, subagent::Subagent, subtype::String, event::Dict{String,Any})
+# `task_updated` or `task_notification`, makes it idle, and the translation
+# forgets it but for the session id of its parent. The usage, the last tool and
+# the summary go in `_meta.claudeCode`, each update with all of them.
+function _update_subagent!(messages, translation::SessionTranslation, subagent::Subagent, subtype::String,
+                           event::Dict{String,Any})
     is_changed = _read_task_fields!(subagent.fields, event)
     patch = get(event, "patch", nothing)
     status = subtype == "task_notification" ? get(event, "status", nothing) :
              subtype == "task_updated" && patch isa AbstractDict ? get(patch, "status", nothing) : nothing
     state = nothing
     if subtype == "task_progress"
-        subagent.is_idle || (state = ACP.RunningStateUpdate())
-    elseif status in ("completed", "failed", "killed", "stopped") && !subagent.is_idle
-        subagent.is_idle = true
+        state = ACP.RunningStateUpdate()
+    elseif status in ("completed", "failed", "killed", "stopped")
         state = ACP.IdleStateUpdate(stop_reason = status == "completed" ? "end_turn" :
                                                   status == "failed" ? nothing : "cancelled")
+        delete!(translation.subagents, subagent.task_id)
+        filter!(pair -> last(pair) != subagent.task_id, translation.subagent_ids)
+        translation.ended_subagents[subagent.task_id] = subagent.parent_id
     end
     (state === nothing && !is_changed) && return nothing
     push!(messages, subagent.parent_id => ACP.SubagentUpdate(
@@ -673,6 +692,9 @@ function _update_background_task!(messages, translation::SessionTranslation, tas
         return nothing
     end
     _push_background_task!(messages, translation, task)
+    # A notification is the last word of `claude` on a task.
+    subtype == "task_notification" && delete!(translation.background_tasks, task.task_id)
+    nothing
 end
 
 # The status of a background task from the status of `claude`: a killed task
@@ -680,16 +702,23 @@ end
 _get_background_status(status::AbstractString) =
     status in ("completed", "failed") ? String(status) : status in ("killed", "stopped") ? "stopped" : "running"
 
+# The notification of the keys of the state of a task that changed since its
+# last notification, or none when no key changed.
 function _push_background_task!(messages, translation::SessionTranslation, task::BackgroundTask)
     translation.state.features.background_tasks || return nothing
-    params = Dict{String,Any}("sessionId" => translation.session_id, "taskId" => task.task_id, "kind" => task.kind,
-                              "title" => task.title, "status" => task.status, "startTime" => task.start_time,
-                              "canStop" => task.status == "running")
-    task.tool_call_id === nothing || (params["toolCallId"] = task.tool_call_id)
-    task.subagent_id === nothing || (params["subagentId"] = task.subagent_id)
-    task.output_uri === nothing || (params["outputUri"] = task.output_uri)
-    task.summary === nothing || (params["summary"] = task.summary)
-    task.end_time === nothing || (params["endTime"] = task.end_time)
+    state = Dict{String,Any}("kind" => task.kind, "title" => task.title, "status" => task.status,
+                             "startTime" => task.start_time, "canStop" => task.status == "running")
+    task.tool_call_id === nothing || (state["toolCallId"] = task.tool_call_id)
+    task.subagent_id === nothing || (state["subagentId"] = task.subagent_id)
+    task.output_uri === nothing || (state["outputUri"] = task.output_uri)
+    task.summary === nothing || (state["summary"] = task.summary)
+    task.end_time === nothing || (state["endTime"] = task.end_time)
+    params = Dict{String,Any}(key => value for (key, value) in state
+                              if !haskey(task.sent, key) || task.sent[key] != value)
+    isempty(params) && return nothing
+    task.sent = state
+    params["sessionId"] = translation.session_id
+    params["taskId"] = task.task_id
     push!(messages, translation.session_id => BackgroundTaskNotification(params))
     nothing
 end

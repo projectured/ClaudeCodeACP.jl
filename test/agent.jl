@@ -337,15 +337,18 @@ count_usage(client) = count(update -> update isa ACP.UsageUpdate, client.updates
         @test failure.message == "Not logged in · Please run /login"
         close_test_agent(test)
 
-        # The events of a failed turn do not reach the next prompt: claude starts again.
+        # A turn that failed at its result keeps claude, and its events do not
+        # reach the next prompt.
         fakes = FakeClaude[]
         test = open_test_agent(make_test_settings([vcat(read_recorded("tool-call.jsonl")[1:3],
                                                         make_result_turn("bad"; is_error = true)),
                                                    make_result_turn("good")]; fakes))
         session = open_test_session(test)
         @test_throws ACP.ProtocolException send_test_prompt(test, session.session_id, "One.")
+        empty!(test.client.updates)
         @test send_test_prompt(test, session.session_id, "Two.").stop_reason == "end_turn"
-        @test length(fakes) == 2
+        @test isempty(test.client.updates)
+        @test length(fakes) == 1
         close_test_agent(test)
     end
 
@@ -651,6 +654,11 @@ count_usage(client) = count(update -> update isa ACP.UsageUpdate, client.updates
         @test states[4].meta["claudeCode"]["usage"]["totalTokens"] == 22368
         main = [last(update) for update in updates if first(update) == session.session_id]
         @test collect_text(main, ACP.AgentMessageChunk) == collect_stream_text(recorded)
+        # The session keeps nothing of the subagent that ended, and no tool call
+        # after a result.
+        translation = test.agent.sessions[session.session_id].translation
+        @test isempty(translation.subagents) && isempty(translation.subagent_ids)
+        @test isempty(translation.state.tool_calls)
         # The next prompt gets only its own turn.
         empty!(test.client.updates)
         @test send_test_prompt(test, session.session_id, "Next.").stop_reason == "end_turn"
@@ -687,13 +695,16 @@ count_usage(client) = count(update -> update isa ACP.UsageUpdate, client.updates
         @test all(first(notification) == "_session/background_task" for notification in client.notifications)
         find_params(task_id) = [last(notification) for notification in client.notifications
                                 if last(notification)["taskId"] == task_id]
-        @test [params["status"] for params in find_params("byowkisnu")] == ["running", "completed", "completed"]
-        @test [params["status"] for params in find_params("b1le9w8sz")] == ["running", "stopped", "stopped"]
-        started = first(find_params("byowkisnu"))
+        # The first notification of a task holds its whole state, and a later
+        # one only what changed: the end, and then the summary and the output.
+        @test [get(params, "status", nothing) for params in find_params("byowkisnu")] == ["running", "completed", nothing]
+        @test [get(params, "status", nothing) for params in find_params("b1le9w8sz")] == ["running", "stopped", nothing]
+        started, ended, notified = find_params("byowkisnu")
         @test started["canStop"] === true && started["startTime"] isa Integer
         @test !haskey(started, "endTime") && !haskey(started, "outputUri")
-        done = last(find_params("byowkisnu"))
-        @test done == Dict{String,Any}(
+        @test sort(collect(keys(ended))) == ["canStop", "endTime", "sessionId", "status", "taskId"]
+        @test sort(collect(keys(notified))) == ["outputUri", "sessionId", "summary", "taskId"]
+        @test merge(started, ended, notified) == Dict{String,Any}(
             "sessionId" => session.session_id, "taskId" => "byowkisnu", "kind" => "local_bash",
             "title" => "Run sleep 5 with echo in background", "status" => "completed",
             "toolCallId" => "toolu_01KPkTMkdnkzNeqWEm6zu2ZV",
@@ -708,6 +719,80 @@ count_usage(client) = count(update -> update isa ACP.UsageUpdate, client.updates
             exception
         end
         @test failure isa ACP.ProtocolException && failure.code == ACP.INVALID_PARAMS
+        @test isempty(test.agent.sessions[session.session_id].translation.background_tasks)
+        close_test_agent(test)
+    end
+
+    @testset "a stop that claude refuses answers its error" begin
+        task_start = first(event for event in read_recorded("background-task.jsonl")
+                           if get(event, "subtype", nothing) == "task_started")
+        session_id = Ref("")
+        test_connection = Ref{Any}(nothing)
+        answers = Any[]
+        client = TestClient()
+        on_call = fake -> begin
+            wait_until(() -> !isempty(client.notifications))
+            push!(answers, try
+                ACP.send_request!(test_connection[], "_session/stop_background_task",
+                    Dict{String,Any}("sessionId" => session_id[], "taskId" => task_start["task_id"]); timeout = 20)
+            catch exception
+                exception
+            end)
+        end
+        turns = [vcat([task_start, Dict{String,Any}("type" => "_call")], make_result_turn("one"))]
+        test = open_test_agent(make_test_settings(turns; on_call, stop_error = "No task to stop."); client,
+                               client_capabilities = make_all_capabilities())
+        test_connection[] = test.connection
+        session = open_test_session(test)
+        session_id[] = session.session_id
+        send_test_prompt(test, session.session_id, "Run it.")
+        @test only(answers) isa ACP.ProtocolException
+        @test only(answers).message == "No task to stop."
+        close_test_agent(test)
+    end
+
+    @testset "an error result of a turn that claude started by itself does not end the next prompt" begin
+        released = Channel{Bool}(1)
+        decisions = Any[]
+        calls = Ref(0)
+        on_call = fake -> begin
+            calls[] += 1
+            calls[] == 1 ? take!(released) :
+                push!(decisions, call_permission_tool(fake, "Bash", Dict{String,Any}("command" => "ls")))
+        end
+        fakes = FakeClaude[]
+        turns = [vcat(make_text_events("One."), make_result_turn("one"), [Dict{String,Any}("type" => "_call")],
+                      make_text_events("Self."), make_result_turn("self"; is_error = true)),
+                 vcat([Dict{String,Any}("type" => "_call")], make_text_events("Two."), make_result_turn("two"))]
+        test = open_test_agent(make_test_settings(turns; on_call, fakes))
+        session = open_test_session(test)
+        @test send_test_prompt(test, session.session_id, "One.").stop_reason == "end_turn"
+        # The second prompt goes to claude while claude runs a turn of its own,
+        # which then fails.
+        prompt = @async send_test_prompt(test, session.session_id, "Two.")
+        @test wait_until(() -> count(message -> message["type"] == "user", only(fakes).received) == 2)
+        put!(released, true)
+        @test fetch(prompt).stop_reason == "end_turn"
+        @test only(decisions)["behavior"] == "allow"
+        @test collect_text(test.client.updates, ACP.AgentMessageChunk) == "One.Self.Two."
+        @test length(fakes) == 1
+        close_test_agent(test)
+    end
+
+    @testset "a prompt that fails at its result while a background task runs keeps claude and the task" begin
+        task_start = first(event for event in read_recorded("background-task.jsonl")
+                           if get(event, "subtype", nothing) == "task_started")
+        fakes = FakeClaude[]
+        client = TestClient()
+        turns = [vcat([task_start], make_result_turn("API Error: 500"; is_error = true)), make_result_turn("two")]
+        test = open_test_agent(make_test_settings(turns; fakes); client, client_capabilities = make_all_capabilities())
+        session = open_test_session(test)
+        @test_throws ACP.ProtocolException send_test_prompt(test, session.session_id, "One.")
+        @test send_test_prompt(test, session.session_id, "Two.").stop_reason == "end_turn"
+        @test length(fakes) == 1
+        @test [last(notification)["status"] for notification in client.notifications] == ["running"]
+        @test test.agent.sessions[session.session_id].translation.background_tasks[task_start["task_id"]].status ==
+              "running"
         close_test_agent(test)
     end
 
@@ -734,7 +819,8 @@ count_usage(client) = count(update -> update isa ACP.UsageUpdate, client.updates
                                                                 id = request["tool_use_id"]))
         turn = Dict{String,Any}[event["type"] == "control_request" ? Dict{String,Any}("type" => "_call") : event
                                 for event in recorded if event["type"] != "control_response"]
-        test = open_test_agent(make_test_settings([turn]; on_call); client = TestClient(choice = "reject"),
+        fakes = FakeClaude[]
+        test = open_test_agent(make_test_settings([turn]; on_call, fakes); client = TestClient(choice = "reject"),
                                client_capabilities = make_all_capabilities())
         session = open_test_session(test)
         send_test_prompt(test, session.session_id, "Plan a README.")
@@ -742,19 +828,45 @@ count_usage(client) = count(update -> update isa ACP.UsageUpdate, client.updates
         markdown = only(update for update in test.client.updates if update isa ACP.PlanUpdate).plan
         @test markdown isa ACP.PlanMarkdown
         @test (markdown.plan_id, markdown.content) == ("plan-mode", request["input"]["plan"])
+        # A question that no prompt can answer sends no plan.
+        @test call_permission_tool(only(fakes), "ExitPlanMode", Dict{String,Any}("plan" => "Other."))["behavior"] ==
+              "deny"
+        @test count(update -> update isa ACP.PlanUpdate, test.client.updates) == 1
+        close_test_agent(test)
+
+        # The plan of a subagent goes to its child session.
+        subagent_start = only(event for event in read_recorded("subagent.jsonl")
+                              if get(event, "subtype", nothing) == "task_started")
+        exit_call = Dict{String,Any}("type" => "assistant", "parent_tool_use_id" => subagent_start["tool_use_id"],
+            "message" => Dict{String,Any}("id" => "m1", "content" => Any[Dict{String,Any}(
+                "type" => "tool_use", "id" => "toolu_exit", "name" => "ExitPlanMode", "input" => Dict{String,Any}())]))
+        client = TestClient(choice = "reject")
+        on_call = fake -> begin
+            wait_until(() -> any(update -> last(update) isa ACP.ToolCall, client.session_updates))
+            call_permission_tool(fake, "ExitPlanMode", Dict{String,Any}("plan" => "# Child plan"); id = "toolu_exit")
+        end
+        test = open_test_agent(make_test_settings([vcat([subagent_start, exit_call, Dict{String,Any}("type" => "_call")],
+                                                        make_result_turn("ok"))]; on_call);
+                               client, client_capabilities = make_all_capabilities())
+        session = open_test_session(test)
+        send_test_prompt(test, session.session_id, "Plan in a subagent.")
+        plan = only(update for update in client.session_updates if last(update) isa ACP.PlanUpdate)
+        @test first(plan) == subagent_start["task_id"]
+        @test last(plan).plan.content == "# Child plan"
         close_test_agent(test)
     end
 
     @testset "a client with no capability beyond version 1 gets the updates of version 1 only" begin
         for name in ("subagent.jsonl", "background-task.jsonl", "plan-steps.jsonl", "plan-mode.jsonl")
             recorded = read_recorded(name)
-            test = open_test_agent(make_test_settings([recorded]))
+            test = open_test_agent(make_test_settings([recorded]; process_id = 2^30))
             session = open_test_session(test)
             send_test_prompt(test, session.session_id, "Go.")
             @test wait_until(() -> count_usage(test.client) == count(event -> event["type"] == "result", recorded))
             @test all(first(update) == session.session_id for update in test.client.session_updates)
             @test all(update -> update isa VERSION_1_UPDATES, test.client.updates)
             @test isempty(test.client.notifications)
+            @test !any(update -> update isa ACP.SessionInfoUpdate && update.meta !== nothing, test.client.updates)
             @test collect_text(test.client.updates, ACP.AgentMessageChunk) == collect_stream_text(recorded)
             @test count(update -> update isa ACP.Plan, test.client.updates) == (name == "plan-steps.jsonl" ? 6 : 0)
             close_test_agent(test)
@@ -796,7 +908,8 @@ count_usage(client) = count(update -> update isa ACP.UsageUpdate, client.updates
 
     @testset "the process id of claude goes to the client once for each process" begin
         test = open_test_agent(make_test_settings([make_result_turn("one"), make_result_turn("two"),
-                                                   make_result_turn("three")]; process_id = 2^30))
+                                                   make_result_turn("three")]; process_id = 2^30);
+                               client_capabilities = make_all_capabilities())
         session = open_test_session(test)
         @test isempty(test.client.updates)
         process_ids() = [update.meta["processId"] for update in test.client.updates

@@ -6,8 +6,10 @@
 
 One `claude -p` process: the stream that takes its messages, and the events
 that it writes, one JSON object on each line. A task reads the events into
-`events`; the last event is `{"type": "process_exit"}`.
-`capabilities` holds the capabilities of its last `system/init`.
+`events`; the last event is `{"type": "process_exit"}`. A `control_response` to
+a control request that waits for its answer goes to `waiting_answers`, by its
+request id, and not to `events`. `capabilities` holds the capabilities of its
+last `system/init`.
 """
 mutable struct ClaudeProcess
     process::Union{Nothing,Base.Process}
@@ -15,6 +17,8 @@ mutable struct ClaudeProcess
     input::IO
     output::IO
     events::Channel{Dict{String,Any}}
+    waiting_answers::Dict{String,Channel{Dict{String,Any}}}
+    answer_lock::ReentrantLock
     capabilities::Vector{String}
     write_lock::ReentrantLock
     is_closed::Bool
@@ -57,7 +61,8 @@ function open_claude_process(streams::Tuple{IO,IO}; process::Union{Nothing,Base.
                              capabilities::Vector{String} = String[])
     input, output = streams
     claude = ClaudeProcess(process, process === nothing ? Int32(0) : Int32(getpid(process)),
-                           input, output, Channel{Dict{String,Any}}(Inf), copy(capabilities),
+                           input, output, Channel{Dict{String,Any}}(Inf),
+                           Dict{String,Channel{Dict{String,Any}}}(), ReentrantLock(), copy(capabilities),
                            ReentrantLock(), false, false, false, Threads.Atomic{Bool}(false))
     errormonitor(@async _read_claude_events!(claude))
     claude
@@ -102,7 +107,7 @@ function _read_claude_events!(claude::ClaudeProcess)
                 capabilities = get(event, "capabilities", nothing)
                 capabilities isa AbstractVector && (claude.capabilities = String[string(item) for item in capabilities])
             end
-            put!(claude.events, event)
+            _take_control_answer!(claude, event) || put!(claude.events, event)
         end
     catch exception
         claude.is_closed || exception isa Base.IOError || @warn "The reader of claude stopped." exception
@@ -110,6 +115,19 @@ function _read_claude_events!(claude::ClaudeProcess)
         claude.is_reader_done = true
         _report_exit!(claude)
     end
+end
+
+# A `control_response` to a request that waits for it goes to that request.
+# Answers whether the event went there.
+function _take_control_answer!(claude::ClaudeProcess, event::Dict{String,Any})
+    get(event, "type", nothing) == "control_response" || return false
+    response = get(event, "response", nothing)
+    request_id = response isa AbstractDict ? get(response, "request_id", nothing) : nothing
+    request_id isa AbstractString || return false
+    answer = lock(() -> pop!(claude.waiting_answers, request_id, nothing), claude.answer_lock)
+    answer === nothing && return false
+    put!(answer, Dict{String,Any}(response))
+    true
 end
 
 # The event `process_exit`, once.
@@ -147,24 +165,41 @@ function interrupt_claude!(claude::ClaudeProcess)
 end
 
 """
-    stop_claude_task!(claude, task_id)
+    stop_claude_task!(claude, task_id) -> Union{Nothing,String}
 
 Stop a background task or a subagent of `claude` with the control request
-`stop_task`. A process that is closed or ending gets nothing.
+`stop_task`, and wait at most ten seconds for the answer of `claude`. Answers
+`nothing` when `claude` stopped it, and else why it did not: the error that
+`claude` answers, or that no answer came.
 """
 function stop_claude_task!(claude::ClaudeProcess, task_id::AbstractString)
-    (claude.is_closed || claude.is_ending) && return nothing
-    _send_control_request!(claude, Dict{String,Any}("subtype" => "stop_task", "task_id" => String(task_id)))
-    nothing
+    (claude.is_closed || claude.is_ending) && return "Claude Code does not run."
+    request_id = string(uuid4())
+    answer = Channel{Dict{String,Any}}(1)
+    lock(() -> claude.waiting_answers[request_id] = answer, claude.answer_lock)
+    try
+        _send_control_request!(claude, Dict{String,Any}("subtype" => "stop_task", "task_id" => String(task_id));
+                               request_id)
+        timedwait(() -> isready(answer) || claude.is_reader_done, 10.0)
+        isready(answer) || return "Claude Code did not answer the stop of `$(task_id)`."
+        response = take!(answer)
+        get(response, "subtype", nothing) == "success" && return nothing
+        message = get(response, "error", nothing)
+        message isa AbstractString && !isempty(message) ? String(message) :
+            "Claude Code did not stop `$(task_id)`."
+    finally
+        lock(() -> delete!(claude.waiting_answers, request_id), claude.answer_lock)
+    end
 end
 
-# A control request on the standard input of `claude`, with a new request id.
-# `claude` answers it with a `control_response`, which the agent does not read.
-# A process whose input closed meanwhile gets nothing.
-function _send_control_request!(claude::ClaudeProcess, request::Dict{String,Any})
+# A control request on the standard input of `claude`, with the request id
+# that its `control_response` names. A process whose input closed meanwhile gets
+# nothing.
+function _send_control_request!(claude::ClaudeProcess, request::Dict{String,Any};
+                                request_id::String = string(uuid4()))
     try
         _write_claude_line!(claude, Dict{String,Any}("type" => "control_request",
-                                                     "request_id" => string(uuid4()), "request" => request))
+                                                     "request_id" => request_id, "request" => request))
     catch exception
         exception isa Base.IOError || exception isa ErrorException || rethrow()
     end

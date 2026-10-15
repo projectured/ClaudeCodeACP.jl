@@ -198,4 +198,37 @@ make_subagent_start(task_id, call_id) = system_event("task_started"; task_id, to
         @test all(params["endTime"] isa Integer for params in ended)
         @test isempty(end_running_tasks!(translation, "stopped"))
     end
+
+    @testset "a session keeps nothing of the subagents and the background tasks that ended" begin
+        translation = SessionTranslation("s"; features = ClientFeatures(subagents = true, background_tasks = true))
+        for index in 1:50
+            call = "call-$(index)"
+            translate_session_event!(translation, make_subagent_start("agent-$(index)", call))
+            read = tool_use("Read", Dict{String,Any}("file_path" => "/a"); id = "read-$(index)")
+            read["parent_tool_use_id"] = call
+            translate_session_event!(translation, read)
+            translate_session_event!(translation, system_event("task_updated"; task_id = "agent-$(index)",
+                                                               patch = Dict{String,Any}("status" => "completed")))
+            translate_session_event!(translation, system_event("task_notification"; task_id = "agent-$(index)",
+                                                               status = "completed", summary = "Done."))
+            translate_session_event!(translation, system_event("task_started"; task_id = "bash-$(index)",
+                                                               tool_use_id = "b-$(index)", task_type = "local_bash"))
+            translate_session_event!(translation, system_event("task_updated"; task_id = "bash-$(index)",
+                patch = Dict{String,Any}("status" => "completed", "end_time" => 1)))
+            translate_session_event!(translation, system_event("task_notification"; task_id = "bash-$(index)",
+                                                               status = "completed", summary = "Done."))
+        end
+        @test isempty(translation.subagents) && isempty(translation.subagent_ids)
+        @test isempty(translation.background_tasks)
+        @test length(translation.ended_subagents) == 50
+        # A late start of a subagent that ended announces nothing.
+        @test isempty(translate_session_event!(translation, make_subagent_start("agent-1", "call-1")))
+        # A late notification of a task that ended sends nothing.
+        @test isempty(translate_session_event!(translation, system_event("task_notification"; task_id = "bash-1",
+                                                                         status = "completed")))
+        # A client without background tasks keeps none.
+        plain = SessionTranslation("s")
+        translate_session_event!(plain, system_event("task_started"; task_id = "b", task_type = "local_bash"))
+        @test isempty(plain.background_tasks)
+    end
 end
