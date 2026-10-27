@@ -127,6 +127,21 @@ pkg> app add ClaudeCodeACP
 Pkg puts the program `claude-code-acp` in `~/.julia/bin`; add that folder to your
 `PATH`.
 
+## Build a native binary
+
+A native binary holds the agent compiled, so it answers an editor sooner than
+the Pkg app. To build one, add the two registries as above, clone this
+repository, and run in the folder of the clone:
+
+```
+julia compile/build.jl
+```
+
+The build installs PackageCompiler in the environment `compile/`. It takes about
+two minutes and needs about 10 GB of memory. The executable is
+`build/claude-code-acp/bin/claude-code-acp`; give its full path to your editor.
+The binary runs on processors of the kind of the machine that built it.
+
 ## Use it in an editor
 
 Give your editor the command `claude-code-acp` as an ACP agent. For example, in

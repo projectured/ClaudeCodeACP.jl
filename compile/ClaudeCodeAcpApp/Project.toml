@@ -1,0 +1,14 @@
+name = "ClaudeCodeAcpApp"
+uuid = "958f5dca-a54c-4c82-aa34-14ca94cb5bfa"
+version = "0.1.0"
+
+[deps]
+ClaudeCodeACP = "397ce549-bc36-418a-97e7-6295a63dbdc4"
+PrecompileTools = "aea7be01-6a6a-4083-8856-8a6e6704d82a"
+
+[sources]
+ClaudeCodeACP = {path = "../.."}
+
+[compat]
+PrecompileTools = "1"
+julia = "1.12"
