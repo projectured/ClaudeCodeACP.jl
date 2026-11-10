@@ -146,6 +146,26 @@ function call_permission_tool(fake::FakeClaude, tool_name, input; secret = nothi
     JSON.parse(answer["result"]["content"][1]["text"]; dicttype = Dict{String,Any})
 end
 
+# A request of `claude` to the MCP server of the agent: its `result`, or its
+# `error`.
+function send_mcp_request(fake::FakeClaude, method, params)
+    server = read_mcp_config(fake)["mcpServers"][ClaudeCodeACP.PERMISSION_SERVER_NAME]
+    body = JSON.json(Dict("jsonrpc" => "2.0", "id" => 8, "method" => method, "params" => params))
+    response = HTTP.post(server["url"], ["Authorization" => server["headers"]["Authorization"],
+                                         "Content-Type" => "application/json"], body)
+    answer = JSON.parse(String(response.body); dicttype = Dict{String,Any})
+    get(answer, "result", get(answer, "error", nothing))
+end
+
+# A call of a tool of the agent, as `claude` makes it: the id of its tool call
+# is in the `_meta` of the request.
+call_agent_tool(fake::FakeClaude, name, arguments; tool_use_id = "toolu_test") =
+    send_mcp_request(fake, "tools/call", Dict("name" => name, "arguments" => arguments,
+                                              "_meta" => Dict("claudecode/toolUseId" => tool_use_id, "progressToken" => 2)))
+
+# The text of the result of a call of a tool.
+read_result_text(result) = only(result["content"])["text"]
+
 # The events of a text that streams, in the shape of `--include-partial-messages`.
 make_text_events(text) = Dict{String,Any}[
     Dict{String,Any}("type" => "stream_event", "event" => Dict{String,Any}(

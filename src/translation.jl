@@ -40,13 +40,15 @@ mutable struct PlanStep
 end
 
 """
-    TurnState(; features = ClientFeatures(), has_stream_events = true)
+    TurnState(; features = ClientFeatures(), has_stream_events = true, terminals = Dict{String,String}())
 
 What the translation keeps across the events of a session or of a subagent: the
 id of the message that streams, the tool calls by their id, the steps of the
 plan, the size of the context of the last request, the updates that the client
 takes, whether the text comes as stream events, as for a session, or only in
-whole messages, as for a subagent, and the last Markdown plan of the plan mode.
+whole messages, as for a subagent, the last Markdown plan of the plan mode, and
+the terminal of the client of each tool call that runs its command there, by
+the id of the call. A session and its subagents share `terminals`.
 """
 mutable struct TurnState
     message_id::Union{Nothing,String}
@@ -56,11 +58,13 @@ mutable struct TurnState
     features::ClientFeatures
     has_stream_events::Bool
     plan_markdown::Union{Nothing,String}
+    terminals::Dict{String,String}
 end
 
-TurnState(; features::ClientFeatures = ClientFeatures(), has_stream_events::Bool = true) =
+TurnState(; features::ClientFeatures = ClientFeatures(), has_stream_events::Bool = true,
+          terminals::Dict{String,String} = Dict{String,String}()) =
     TurnState(nothing, Dict{String,Tuple{String,Dict{String,Any}}}(), PlanStep[], 0, features,
-              has_stream_events, nothing)
+              has_stream_events, nothing, terminals)
 
 """
     translate_event!(state, event) -> Vector{ACP.SessionUpdate}
@@ -163,8 +167,10 @@ function _make_tool_call!(state::TurnState, block::Dict{String,Any})
     input isa Dict{String,Any} || (input = Dict{String,Any}())
     state.tool_calls[id] = (name, input)
     path = _find_path(input)
+    terminal = get(state.terminals, id, nothing)
     ACP.ToolCall(tool_call_id = id, title = format_tool_title(name, input), name = name, kind = get_tool_kind(name),
                  status = "pending", raw_input = input,
+                 content = terminal === nothing ? nothing : ACP.ToolCallContent[ACP.Terminal(terminal_id = terminal)],
                  locations = path === nothing ? nothing : [ACP.ToolCallLocation(path = path)],
                  meta = Dict{String,Any}("claudeCode" => Dict{String,Any}("toolName" => name)))
 end
@@ -173,8 +179,13 @@ function _make_tool_result!(state::TurnState, block::Dict{String,Any}, tool_use_
     id = string(get(block, "tool_use_id", ""))
     name, input = get(state.tool_calls, id, ("", Dict{String,Any}()))
     is_error = get(block, "is_error", false) === true
+    terminal = pop!(state.terminals, id, nothing)
     content = ACP.ToolCallContent[]
-    if !is_error && name == "Edit" && haskey(input, "file_path")
+    # The card of a command that ran in a terminal of the client keeps that
+    # terminal, which shows its output.
+    if terminal !== nothing
+        push!(content, ACP.Terminal(terminal_id = terminal))
+    elseif !is_error && name == "Edit" && haskey(input, "file_path")
         push!(content, ACP.Diff(path = string(input["file_path"]), old_text = string(get(input, "old_string", "")),
                                 new_text = string(get(input, "new_string", ""))))
     elseif !is_error && name == "Write" && haskey(input, "file_path")
@@ -252,10 +263,11 @@ end
     format_tool_title(name, input) -> String
 
 A short title for a call of the tool `name` with `input`, as an editor shows it.
+The Bash tool of the agent gets the title of the own `Bash` of Claude Code.
 """
 function format_tool_title(name::AbstractString, input::Dict{String,Any})
     field(key) = (value = get(input, key, nothing); value isa AbstractString ? String(value) : "")
-    title = if name == "Bash"
+    title = if name in ("Bash", BASH_TOOL_NAME)
         something(_find_nonempty(field("description")), _find_nonempty(field("command")), "Run a command")
     elseif name == "Read"
         "Read " * field("file_path")
@@ -292,12 +304,13 @@ _find_nonempty(text::String) = isempty(text) ? nothing : text
     get_tool_kind(name) -> String
 
 The ACP kind of a tool of Claude Code: `read`, `edit`, `execute`, `search`,
-`fetch`, `think` or `other`.
+`fetch`, `think` or `other`. The Bash tool of the agent is `execute`, as the
+own `Bash` is.
 """
 get_tool_kind(name::AbstractString) =
     name == "Read" ? "read" :
     name in ("Edit", "Write", "NotebookEdit") ? "edit" :
-    name == "Bash" ? "execute" :
+    name in ("Bash", BASH_TOOL_NAME) ? "execute" :
     name in ("Grep", "Glob", "ToolSearch") ? "search" :
     name in ("WebFetch", "WebSearch") ? "fetch" :
     name in ("Task", "Agent") ? "think" : "other"
@@ -578,7 +591,8 @@ function _start_subagent!(messages, translation::SessionTranslation, task_id::St
     tool_use_id = _get_text(event, "tool_use_id")
     parent_id = something(_find_subagent_id(translation, tool_use_id), translation.session_id)
     translation.subagents[task_id] = Subagent(task_id, parent_id,
-        TurnState(features = translation.state.features, has_stream_events = false), Dict{String,Any}())
+        TurnState(features = translation.state.features, has_stream_events = false,
+                  terminals = translation.state.terminals), Dict{String,Any}())
     tool_use_id === nothing || (translation.subagent_ids[tool_use_id] = task_id)
     push!(messages, parent_id => ACP.SubagentUpdate(
         session_id = task_id, title = _get_text(event, "description"), description = _get_text(event, "subagent_type"),

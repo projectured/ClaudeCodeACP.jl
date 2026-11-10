@@ -1,7 +1,8 @@
 # The permission tool: a small MCP server on the loopback address, which serves
-# one tool to each `claude` of the agent. `claude` calls it, through
-# `--permission-prompt-tool`, before it runs a tool that needs the word of the
-# person. The bearer secret of a request names its session.
+# the tools of the agent to each `claude` of the agent. `claude` calls the
+# permission tool, through `--permission-prompt-tool`, before it runs a tool that
+# needs the word of the person. The bearer secret of a request names its
+# session.
 
 # The name of the server in the MCP configuration of `claude`, and its tool.
 const PERMISSION_SERVER_NAME = "claude_code_acp"
@@ -12,27 +13,35 @@ const PERMISSION_TOOL_NAME = "mcp__$(PERMISSION_SERVER_NAME)__$(PERMISSION_TOOL)
     PermissionServer
 
 The MCP server of the permission tool: its HTTP server on `127.0.0.1`, its
-port, and two functions. `find_session(secret)` answers the session that the
+port, and four functions. `find_session(secret)` answers the session that the
 secret names, or `nothing`; a request with another secret gets `401`.
 `decide(session, tool_name, input, tool_use_id)` answers the JSON object of the
-decision for a call of the tool.
+decision for a call of the permission tool. `list_tools(session)` answers the
+other tools that the server serves to the session, as `tools/list` names them,
+and `call_tool(session, name, arguments, tool_use_id)` answers the result of a
+call of one of them, or `nothing` for a tool that the session does not have.
+`tool_use_id` is the id of the tool call of Claude that made the call, or
+empty when `claude` does not name it.
 """
 mutable struct PermissionServer
     server::Any
     port::Int
     find_session::Function
     decide::Function
+    list_tools::Function
+    call_tool::Function
 end
 
 """
-    start_permission_server!(find_session, decide) -> PermissionServer
+    start_permission_server!(find_session, decide, list_tools, call_tool) -> PermissionServer
 
 Start the server on a port that no other program holds.
 """
-function start_permission_server!(find_session::Function, decide::Function)
+function start_permission_server!(find_session::Function, decide::Function, list_tools::Function,
+                                  call_tool::Function)
     listener = Sockets.listen(Sockets.localhost, 0)
     port = Int(last(Sockets.getsockname(listener)))
-    permission = PermissionServer(nothing, port, find_session, decide)
+    permission = PermissionServer(nothing, port, find_session, decide, list_tools, call_tool)
     permission.server = HTTP.serve!(request -> _answer_http_request(permission, request),
                                     "127.0.0.1", port; server = listener, verbose = -1)
     permission
@@ -135,10 +144,17 @@ function _answer_mcp_request(permission::PermissionServer, session, message::Dic
                     "tool_name" => Dict{String,Any}("type" => "string"),
                     "input" => Dict{String,Any}("type" => "object"),
                     "tool_use_id" => Dict{String,Any}("type" => "string")),
-                "required" => Any["tool_name", "input"]))]))
+                "required" => Any["tool_name", "input"])), permission.list_tools(session)...]))
     elseif method == "tools/call"
         arguments = get(params, "arguments", nothing)
         arguments isa Dict{String,Any} || (arguments = Dict{String,Any}())
+        name = string(get(params, "name", ""))
+        if name != PERMISSION_TOOL
+            result = permission.call_tool(session, name, arguments, _read_tool_use_id(params))
+            result === nothing && return Dict{String,Any}("error" => Dict{String,Any}(
+                "code" => -32602, "message" => "No tool `$(name)`."))
+            return Dict{String,Any}("result" => result)
+        end
         input = get(arguments, "input", nothing)
         decision = permission.decide(session, string(get(arguments, "tool_name", "")),
                                      input isa Dict{String,Any} ? input : Dict{String,Any}(),
@@ -147,4 +163,13 @@ function _answer_mcp_request(permission::PermissionServer, session, message::Dic
             "type" => "text", "text" => JSON.json(decision))]))
     end
     Dict{String,Any}("error" => Dict{String,Any}("code" => -32601, "message" => "No method `$(method)`."))
+end
+
+# The id of the tool call of Claude that made a call of a tool: `claude` names it
+# in the `_meta` of `tools/call` as `claudecode/toolUseId`. Empty when it does
+# not.
+function _read_tool_use_id(params::Dict{String,Any})
+    meta = get(params, "_meta", nothing)
+    id = meta isa AbstractDict ? get(meta, "claudecode/toolUseId", nothing) : nothing
+    id isa AbstractString ? String(id) : ""
 end

@@ -1,6 +1,20 @@
 # The agent through ACP, with a client of AgentClientProtocol in this process and
 # a fake `claude` that plays recorded turns.
 
+# A terminal of the test client: the request that created it, its output, its
+# exit code or the signal that ended it, and whether the agent killed it and
+# released it. Its command runs nothing.
+mutable struct FakeTerminal
+    request::ACP.CreateTerminalRequest
+    output::String
+    exit_code::Union{Nothing,Int}
+    signal::Union{Nothing,String}
+    is_ended::Bool
+    ended::Base.Event
+    is_killed::Bool
+    is_released::Bool
+end
+
 mutable struct TestClient <: ACP.ClientHandler
     updates::Vector{Any}
     questions::Vector{Any}
@@ -10,14 +24,64 @@ mutable struct TestClient <: ACP.ClientHandler
     form_content::Any
     session_updates::Vector{Pair{String,Any}}
     notifications::Vector{Pair{String,Any}}
+    run_terminal::Function
+    terminals::Vector{FakeTerminal}
 end
 
 # A client that answers each permission question with `choice`, and each form
 # with `form_content`, or declines it when that is `nothing`. `updates` holds the
 # updates of all sessions, `session_updates` each with its session id, and
-# `notifications` the extension notifications with their method.
-TestClient(; choice = "allow", on_update = (client, update) -> nothing, form_content = nothing) =
-    TestClient(Any[], Any[], choice, on_update, Any[], form_content, Pair{String,Any}[], Pair{String,Any}[])
+# `notifications` the extension notifications with their method. A terminal
+# gets its output and its exit code from `run_terminal(request)`; an exit code
+# `nothing` is a command that runs until a kill. The id of the terminal `i` of
+# `terminals` is `term-i`.
+TestClient(; choice = "allow", on_update = (client, update) -> nothing, form_content = nothing,
+           run_terminal = request -> ("", 0)) =
+    TestClient(Any[], Any[], choice, on_update, Any[], form_content, Pair{String,Any}[], Pair{String,Any}[],
+               run_terminal, FakeTerminal[])
+
+function ACP.answer_request(client::TestClient, request::ACP.CreateTerminalRequest, context)
+    output, exit_code = client.run_terminal(request)
+    terminal = FakeTerminal(request, output, exit_code, nothing, exit_code !== nothing, Base.Event(), false, false)
+    terminal.is_ended && notify(terminal.ended)
+    push!(client.terminals, terminal)
+    ACP.CreateTerminalResponse(terminal_id = "term-$(length(client.terminals))")
+end
+
+find_terminal(client::TestClient, id) = client.terminals[parse(Int, last(split(id, '-')))]
+
+function _end_terminal!(terminal::FakeTerminal)
+    terminal.is_ended && return nothing
+    terminal.signal = "SIGKILL"
+    terminal.is_ended = true
+    notify(terminal.ended)
+end
+
+function ACP.answer_request(client::TestClient, request::ACP.WaitForTerminalExitRequest, context)
+    terminal = find_terminal(client, request.terminal_id)
+    wait(terminal.ended)
+    ACP.WaitForTerminalExitResponse(exit_code = terminal.exit_code, signal = terminal.signal)
+end
+
+function ACP.answer_request(client::TestClient, request::ACP.TerminalOutputRequest, context)
+    terminal = find_terminal(client, request.terminal_id)
+    ACP.TerminalOutputResponse(output = terminal.output, truncated = false, exit_status = terminal.is_ended ?
+        ACP.TerminalExitStatus(exit_code = terminal.exit_code, signal = terminal.signal) : nothing)
+end
+
+function ACP.answer_request(client::TestClient, request::ACP.KillTerminalRequest, context)
+    terminal = find_terminal(client, request.terminal_id)
+    terminal.is_killed = true
+    _end_terminal!(terminal)
+    ACP.KillTerminalResponse()
+end
+
+function ACP.answer_request(client::TestClient, request::ACP.ReleaseTerminalRequest, context)
+    terminal = find_terminal(client, request.terminal_id)
+    terminal.is_released = true
+    _end_terminal!(terminal)
+    ACP.ReleaseTerminalResponse()
+end
 
 function ACP.answer_request(client::TestClient, request::ACP.CreateElicitationRequest, context)
     push!(client.forms, request)
@@ -978,6 +1042,147 @@ count_usage(client) = count(update -> update isa ACP.UsageUpdate, client.updates
         session_id[] = session.session_id
         @test send_test_prompt(test, session.session_id, "Run it.").stop_reason == "cancelled"
         @test only(decisions)["behavior"] == "deny"
+        close_test_agent(test)
+    end
+
+    @testset "an editor that offers terminals runs the commands of Claude, and the card shows the terminal" begin
+        bash = ClaudeCodeACP.BASH_TOOL_NAME
+        input_1 = Dict{String,Any}("command" => "echo hi", "description" => "Say hi")
+        input_2 = Dict{String,Any}("command" => "exit 2")
+        client = TestClient(run_terminal = request -> request.args[2] == "exit 2" ? ("no\n", 2) : ("hi\n", 0))
+        results = Any[]
+        calls = Ref(0)
+        on_call = fake -> begin
+            calls[] += 1
+            if calls[] == 1
+                # The card of the call is in the client before the command runs.
+                wait_until(() -> any(update -> update isa ACP.ToolCall, client.updates))
+                push!(results, call_permission_tool(fake, bash, input_1; id = "toolu_1"))
+                push!(results, call_agent_tool(fake, "Bash", input_1; tool_use_id = "toolu_1"))
+            else
+                # The command runs before the event of its call comes.
+                push!(results, call_agent_tool(fake, "Bash", input_2; tool_use_id = "toolu_2"))
+            end
+        end
+        call = Dict{String,Any}("type" => "_call")
+        turn = vcat([tool_use(bash, input_1; id = "toolu_1"), call, tool_result("hi\n"; id = "toolu_1"), call,
+                     tool_use(bash, input_2; id = "toolu_2"), tool_result("no\nExit code 2"; id = "toolu_2", is_error = true)],
+                    make_result_turn("done"))
+        fakes = FakeClaude[]
+        test = open_test_agent(make_test_settings([turn]; on_call, fakes); client,
+                               client_capabilities = ACP.ClientCapabilities(terminal = true))
+        session = open_test_session(test)
+        fake = only(fakes)
+        # claude runs without its own Bash, the tools of a command in the
+        # background need no question, and a call may take as long as a command.
+        @test "--disallowedTools=AskUserQuestion,Bash" in fake.arguments
+        @test "--allowedTools=mcp__claude_code_acp__BashOutput,mcp__claude_code_acp__KillBash" in fake.arguments
+        @test read_mcp_config(fake)["mcpServers"][ClaudeCodeACP.PERMISSION_SERVER_NAME]["timeout"] == 100_000_000
+        tools = send_mcp_request(fake, "tools/list", Dict())["tools"]
+        @test [tool["name"] for tool in tools] == ["permission", "Bash", "BashOutput", "KillBash"]
+        @test all(tool -> tool["_meta"]["anthropic/alwaysLoad"] === true, tools[2:end])
+        @test sort(collect(keys(tools[2]["inputSchema"]["properties"]))) ==
+              ["command", "description", "run_in_background", "timeout"]
+        @test send_test_prompt(test, session.session_id, "Run it.").stop_reason == "end_turn"
+        decision, first_result, second_result = results
+        @test decision["behavior"] == "allow"
+        question = only(client.questions)
+        @test (question.tool_call.title, question.tool_call.kind) == ("Say hi", "execute")
+        @test first(question.options).name == "Always allow Bash"
+        @test first_result == Dict{String,Any}("content" => Any[Dict{String,Any}("type" => "text", "text" => "hi\n")],
+                                               "isError" => false)
+        @test read_result_text(second_result) == "no\nExit code 2"
+        @test second_result["isError"] === true
+        first_terminal, second_terminal = client.terminals
+        request = first_terminal.request
+        @test (request.session_id, request.command, request.args, request.cwd, request.output_byte_limit) ==
+              (session.session_id, "bash", ["-c", "echo hi"], TEST_FOLDER, 30_000)
+        @test first_terminal.is_released && second_terminal.is_released
+        @test !first_terminal.is_killed
+        find_updates(id) = [update for update in client.updates
+                            if update isa Union{ACP.ToolCall,ACP.ToolCallUpdate} && update.tool_call_id == id]
+        card, terminal, ended = find_updates("toolu_1")
+        @test (card.kind, card.title, card.content) == ("execute", "Say hi", nothing)
+        @test only(terminal.content).terminal_id == "term-1"
+        @test (ended.status, only(ended.content).terminal_id) == ("completed", "term-1")
+        # A call that the translation does not know yet gets its terminal with its card.
+        card, ended = find_updates("toolu_2")
+        @test (card.title, only(card.content).terminal_id) == ("exit 2", "term-2")
+        @test (ended.status, only(ended.content).terminal_id) == ("failed", "term-2")
+        @test isempty(test.agent.sessions[session.session_id].translation.state.terminals)
+        close_test_agent(test)
+    end
+
+    @testset "a command stops at its timeout, and a command in the background is read, stopped and released" begin
+        outputs = Dict("sleep 100" => ("", nothing), "serve" => ("started\n", nothing), "make" => ("built\n", 0))
+        client = TestClient(run_terminal = request -> outputs[request.args[2]])
+        fakes = FakeClaude[]
+        test = open_test_agent(make_test_settings([]; fakes); client,
+                               client_capabilities = ACP.ClientCapabilities(terminal = true))
+        session = open_test_session(test)
+        fake = only(fakes)
+        agent_session = test.agent.sessions[session.session_id]
+        held() = lock(() -> copy(agent_session.terminals), agent_session.lock)
+        result = call_agent_tool(fake, "Bash", Dict{String,Any}("command" => "sleep 100", "timeout" => 300))
+        @test read_result_text(result) == "(no output)\nThe command was stopped after 300 ms."
+        @test result["isError"] === true
+        @test client.terminals[1].is_killed && client.terminals[1].is_released
+        # In the background, the answer is the id of the terminal, at once.
+        result = call_agent_tool(fake, "Bash", Dict{String,Any}("command" => "serve", "run_in_background" => true))
+        @test startswith(read_result_text(result), "The command runs in the background with the id `term-2`.")
+        @test held() == Set(["term-2"])
+        @test !client.terminals[2].is_released
+        @test read_result_text(call_agent_tool(fake, "BashOutput", Dict{String,Any}("bash_id" => "term-2"))) ==
+              "started\nThe command runs."
+        @test read_result_text(call_agent_tool(fake, "KillBash", Dict{String,Any}("bash_id" => "term-2"))) ==
+              "The command `term-2` is stopped."
+        @test client.terminals[2].is_killed && client.terminals[2].is_released
+        @test isempty(held())
+        result = call_agent_tool(fake, "BashOutput", Dict{String,Any}("bash_id" => "term-2"))
+        @test read_result_text(result) == "No command `term-2` runs in the background of this session."
+        @test result["isError"] === true
+        # A command in the background that ended answers its exit code.
+        call_agent_tool(fake, "Bash", Dict{String,Any}("command" => "make", "run_in_background" => true))
+        @test read_result_text(call_agent_tool(fake, "BashOutput", Dict{String,Any}("bash_id" => "term-3"))) ==
+              "built\nExit code 0"
+        # A close of the session releases the terminals that it holds.
+        call_agent_tool(fake, "Bash", Dict{String,Any}("command" => "serve", "run_in_background" => true))
+        ACP.send_request!(test.connection, ACP.CloseSessionRequest(session_id = session.session_id); timeout = 10)
+        @test wait_until(() -> client.terminals[3].is_released && client.terminals[4].is_released)
+        @test !client.terminals[3].is_killed
+        close_test_agent(test)
+    end
+
+    @testset "a cancel of the prompt stops a command in the foreground" begin
+        client = TestClient(run_terminal = request -> ("", nothing))
+        fakes = FakeClaude[]
+        test = open_test_agent(make_test_settings([]; fakes); client,
+                               client_capabilities = ACP.ClientCapabilities(terminal = true))
+        session = open_test_session(test)
+        agent_session = test.agent.sessions[session.session_id]
+        lock(() -> agent_session.is_prompting = true, agent_session.lock)
+        canceller = @async (sleep(0.3); lock(() -> agent_session.is_cancelled = true, agent_session.lock))
+        result = call_agent_tool(only(fakes), "Bash", Dict{String,Any}("command" => "sleep 100"))
+        wait(canceller)
+        @test read_result_text(result) == "(no output)\nThe command was stopped."
+        @test only(client.terminals).is_killed && only(client.terminals).is_released
+        lock(() -> agent_session.is_prompting = false, agent_session.lock)
+        close_test_agent(test)
+    end
+
+    @testset "an editor that offers no terminals keeps the own Bash of claude" begin
+        fakes = FakeClaude[]
+        client = TestClient()
+        test = open_test_agent(make_test_settings([]; fakes); client)
+        open_test_session(test)
+        fake = only(fakes)
+        @test "--disallowedTools=AskUserQuestion" in fake.arguments
+        @test !any(argument -> startswith(argument, "--allowedTools"), fake.arguments)
+        @test !haskey(read_mcp_config(fake)["mcpServers"][ClaudeCodeACP.PERMISSION_SERVER_NAME], "timeout")
+        @test [tool["name"] for tool in send_mcp_request(fake, "tools/list", Dict())["tools"]] == ["permission"]
+        @test send_mcp_request(fake, "tools/call", Dict("name" => "Bash",
+                                                        "arguments" => Dict("command" => "ls")))["code"] == -32602
+        @test isempty(client.terminals)
         close_test_agent(test)
     end
 end

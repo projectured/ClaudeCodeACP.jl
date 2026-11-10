@@ -20,6 +20,9 @@ make_subagent_start(task_id, call_id) = system_event("task_started"; task_id, to
         @test format_tool_title("Read", Dict{String,Any}("file_path" => "/a.jl")) == "Read /a.jl"
         @test format_tool_title("Bash", Dict{String,Any}("command" => "ls")) == "ls"
         @test format_tool_title("Bash", Dict{String,Any}("command" => "ls", "description" => "List")) == "List"
+        # The Bash tool of the agent has the card of the own Bash.
+        @test format_tool_title(ClaudeCodeACP.BASH_TOOL_NAME, Dict{String,Any}("command" => "ls")) == "ls"
+        @test get_tool_kind(ClaudeCodeACP.BASH_TOOL_NAME) == "execute"
         @test format_tool_title("mcp__projectured__execute_julia_code", Dict{String,Any}()) ==
               "projectured: execute_julia_code"
         @test get_tool_kind("Edit") == "edit"

@@ -9,7 +9,9 @@ standard input and output. For each session the agent starts one
 `claude -p` process, which streams its work as JSON, and translates that stream
 into the updates of the session. Before Claude Code runs a tool that needs the
 word of the person, it calls the permission tool of the agent, a small MCP
-server on the loopback address, and the agent asks the editor.
+server on the loopback address, and the agent asks the editor. For an editor
+that offers terminals, that server also serves a Bash tool, which runs each
+command of Claude in a terminal of the editor.
 
 The agent uses the sign-in of `claude` and reads no credential.
 """
@@ -28,6 +30,7 @@ include("process.jl")
 include("translation.jl")
 include("permission.jl")
 include("agent.jl")
+include("terminal.jl")
 include("program.jl")
 
 end # module ClaudeCodeACP

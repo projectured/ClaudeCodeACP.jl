@@ -40,6 +40,8 @@ echoed when a turn took them, `earlier_results` the `result`s of its `claude`
 that came or come before the one of its first message, `is_steerable` says that
 a message can still go into it, and `prompt_end` takes its stop reason or its
 error from the reader of the events. `reported_process` is the process whose id went to the editor.
+`terminals` holds the terminals of the editor that run the commands of Claude
+in the background, until Claude stops them or the session closes.
 `send_lock` keeps the messages of the translation in their order; a task that
 holds it may take `lock`, and never the other way round.
 """
@@ -70,6 +72,7 @@ mutable struct ClaudeSession
     prompt_end::Union{Nothing,Channel{Any}}
     reported_process::Union{Nothing,ClaudeProcess}
     waiting_permissions::Vector{ACP.OutgoingRequest}
+    terminals::Set{String}
     lock::ReentrantLock
     send_lock::ReentrantLock
 end
@@ -87,12 +90,13 @@ mutable struct ClaudeCodeAgent <: ACP.AgentHandler
     connection::Union{Nothing,ACP.Connection}
     has_thinking_display::Union{Nothing,Bool}
     has_question_forms::Bool
+    has_terminals::Bool
     features::ClientFeatures
     lock::ReentrantLock
 end
 
 ClaudeCodeAgent(settings::AgentSettings = AgentSettings()) =
-    ClaudeCodeAgent(settings, Dict{String,ClaudeSession}(), nothing, nothing, nothing, false, ClientFeatures(),
+    ClaudeCodeAgent(settings, Dict{String,ClaudeSession}(), nothing, nothing, nothing, false, false, ClientFeatures(),
                     ReentrantLock())
 
 # --- The options of a session ------------------------------------------------
@@ -138,7 +142,9 @@ setting `showThinkingSummaries` and, when `claude` takes it, the flag
 `--thinking-display summarized`, the permission tool, the session id or the
 session to resume, the options that the person chose, the file of the addition
 to the system prompt when the editor gave one, and the file of the MCP
-configuration, which holds the secrets and so is not on the command line.
+configuration, which holds the secrets and so is not on the command line. For an
+editor that offers terminals, the own `Bash` of `claude` is off, and the tools
+of the agent for a command in the background run without a question.
 """
 function make_claude_arguments(agent::ClaudeCodeAgent, session::ClaudeSession, mcp_config_path::String;
                                system_prompt_path::Union{Nothing,String} = nothing)
@@ -149,8 +155,13 @@ function make_claude_arguments(agent::ClaudeCodeAgent, session::ClaudeSession, m
                        "--permission-prompt-tool", PERMISSION_TOOL_NAME]
     _has_thinking_display!(agent) && append!(arguments, ["--thinking-display", "summarized"])
     # An editor that can not show a form gets no question from the tool, and
-    # Claude asks in its text.
-    agent.has_question_forms || push!(arguments, "--disallowedTools=AskUserQuestion")
+    # Claude asks in its text. An editor that offers terminals runs each command.
+    disallowed = String[]
+    agent.has_question_forms || push!(disallowed, "AskUserQuestion")
+    agent.has_terminals && append!(disallowed, REPLACED_TOOLS)
+    isempty(disallowed) || push!(arguments, "--disallowedTools=" * join(disallowed, ","))
+    agent.has_terminals &&
+        push!(arguments, "--allowedTools=" * join([BASH_OUTPUT_TOOL_NAME, KILL_BASH_TOOL_NAME], ","))
     append!(arguments, session.has_history ? ["--resume", session.id] : ["--session-id", session.id])
     for option in SESSION_OPTIONS
         option.id in session.chosen_options || continue
@@ -168,7 +179,8 @@ end
     make_mcp_config(agent, session) -> Dict
 
 The MCP configuration of the `claude` of a session: the MCP servers of the
-editor, and the permission server with the secret of the session.
+editor, and the permission server with the secret of the session, which also
+serves the Bash tool of the agent to an editor that offers terminals.
 """
 function make_mcp_config(agent::ClaudeCodeAgent, session::ClaudeSession)
     servers = Dict{String,Any}()
@@ -176,8 +188,9 @@ function make_mcp_config(agent::ClaudeCodeAgent, session::ClaudeSession)
         config = _make_mcp_server_config(server)
         config === nothing || (servers[first(config)] = last(config))
     end
-    servers[PERMISSION_SERVER_NAME] = make_permission_mcp_server(_get_or_start_permission_server!(agent),
-                                                                 session.secret)
+    permission = make_permission_mcp_server(_get_or_start_permission_server!(agent), session.secret)
+    agent.has_terminals && (permission["timeout"] = BASH_CALL_MILLISECONDS)
+    servers[PERMISSION_SERVER_NAME] = permission
     Dict{String,Any}("mcpServers" => servers)
 end
 
@@ -239,7 +252,10 @@ function _get_or_start_permission_server!(agent::ClaudeCodeAgent)
         agent.permission === nothing &&
             (agent.permission = start_permission_server!(secret -> _find_session_by_secret(agent, secret),
                 (session, tool_name, input, tool_use_id) ->
-                    decide_permission!(agent, session, tool_name, input, tool_use_id)))
+                    decide_permission!(agent, session, tool_name, input, tool_use_id),
+                session -> agent.has_terminals ? make_bash_tools() : Dict{String,Any}[],
+                (session, name, arguments, tool_use_id) ->
+                    agent.has_terminals ? call_bash_tool!(agent, session, name, arguments, tool_use_id) : nothing))
         agent.permission
     end
 end
@@ -372,6 +388,7 @@ end
 function ACP.answer_request(agent::ClaudeCodeAgent, request::ACP.InitializeRequest, context)
     agent.connection = context.connection
     agent.has_question_forms = _has_question_forms(request)
+    agent.has_terminals = _has_terminals(request)
     agent.features = _read_client_features(request)
     ACP.InitializeResponse(
         protocol_version = ACP.PROTOCOL_VERSION,
@@ -401,6 +418,13 @@ function _has_question_forms(request::ACP.InitializeRequest)
     capabilities = request.client_capabilities
     elicitation = capabilities === nothing ? nothing : capabilities.elicitation
     elicitation !== nothing && elicitation.form !== nothing
+end
+
+# Whether the editor runs a command in a terminal of its own: it says so with
+# `clientCapabilities.terminal`.
+function _has_terminals(request::ACP.InitializeRequest)
+    capabilities = request.client_capabilities
+    capabilities !== nothing && capabilities.terminal === true
 end
 
 # The updates beyond version 1 of ACP that the editor takes:
@@ -461,7 +485,7 @@ function _open_session!(agent::ClaudeCodeAgent, id::String, directory::String, m
                             Dict(option.id => "default" for option in SESSION_OPTIONS), Set{String}(),
                             nothing, String[], has_history, false, nothing, String[], Set{String}(),
                             SessionTranslation(id; features = agent.features), false, false, false, 0, 0, 0, false,
-                            nothing, nothing, ACP.OutgoingRequest[], ReentrantLock(), ReentrantLock())
+                            nothing, nothing, ACP.OutgoingRequest[], Set{String}(), ReentrantLock(), ReentrantLock())
     is_open = lock(agent.lock) do
         haskey(agent.sessions, id) || (agent.sessions[id] = session; return false)
         true
@@ -546,12 +570,13 @@ end
 
 function ACP.answer_request(agent::ClaudeCodeAgent, request::ACP.CloseSessionRequest, context)
     session = lock(() -> pop!(agent.sessions, request.session_id, nothing), agent.lock)
-    session === nothing || _close_session!(session)
+    session === nothing || _close_session!(agent, session)
     ACP.CloseSessionResponse()
 end
 
-# A close works as a cancel of the prompt that runs, and then ends `claude`.
-function _close_session!(session::ClaudeSession)
+# A close works as a cancel of the prompt that runs, and then ends `claude` and
+# the commands that it runs in the background in the editor.
+function _close_session!(agent::ClaudeCodeAgent, session::ClaudeSession)
     process, requests = lock(session.lock) do
         session.is_closed = true
         session.is_prompting && (session.is_cancelled = true)
@@ -562,6 +587,7 @@ function _close_session!(session::ClaudeSession)
         interrupt_claude!(process)
         close_claude_process!(process)
     end
+    _release_session_terminals!(agent, session)
     rm(session.config_folder; recursive = true, force = true)
     nothing
 end
@@ -587,7 +613,7 @@ function close_agent!(agent::ClaudeCodeAgent)
         sessions
     end
     @sync for session in sessions
-        @async _close_session!(session)
+        @async _close_session!(agent, session)
     end
     permission = lock(() -> (permission = agent.permission; agent.permission = nothing; permission), agent.lock)
     permission === nothing || stop_permission_server!(permission)
@@ -754,7 +780,10 @@ function _follow_event!(agent::ClaudeCodeAgent, session::ClaudeSession, process:
         is_prompting && lock(() -> session.taken_messages += 1, session.lock)
     elseif type == "result"
         _send_usage!(session, event, connection)
-        lock(() -> empty!(session.translation.state.tool_calls), session.lock)
+        lock(session.lock) do
+            empty!(session.translation.state.tool_calls)
+            empty!(session.translation.state.terminals)
+        end
         is_prompting || return nothing
         is_ending = lock(session.lock) do
             session.is_cancelled || session.taken_messages >= session.sent_messages ||
@@ -1064,8 +1093,10 @@ function decide_permission!(agent::ClaudeCodeAgent, session::ClaudeSession, tool
     tool_call = ACP.ToolCallUpdate(tool_call_id = tool_use_id, title = format_tool_title(tool_name, input),
                                    name = tool_name, kind = get_tool_kind(tool_name), status = "pending",
                                    raw_input = input)
+    # The Bash tool of the agent asks as the own `Bash` does.
+    shown_name = tool_name == BASH_TOOL_NAME ? "Bash" : tool_name
     options = ACP.PermissionOption[
-        ACP.PermissionOption(option_id = "allow_always", name = "Always allow $(tool_name)", kind = "allow_always"),
+        ACP.PermissionOption(option_id = "allow_always", name = "Always allow $(shown_name)", kind = "allow_always"),
         ACP.PermissionOption(option_id = "allow", name = "Allow", kind = "allow_once"),
         ACP.PermissionOption(option_id = "reject", name = "Reject", kind = "reject_once")]
     request = try

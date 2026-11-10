@@ -36,6 +36,21 @@ several, and a text field for an answer in your own words. Your answers go back
 to Claude. An editor that shows no form gets no such question: Claude then asks
 in its text.
 
+An editor that runs commands in terminals of its own
+(`clientCapabilities.terminal`) runs each command of Claude. The agent then
+gives Claude a tool `Bash` of its own, with the inputs of the own one of Claude
+Code (`command`, `timeout`, `description` and `run_in_background`), and turns
+the own `Bash` off. A command runs as `bash -c` with the command, in the folder
+of the session, in a terminal of the editor (`terminal/create`), and the card of
+its tool call gets that terminal, so the editor shows the output as it comes.
+Before a command runs, the editor asks you, as for the own `Bash`. A command in
+the foreground ends at its timeout, two minutes unless Claude gives another of
+at most ten, and at a cancel; its terminal is then released. A command in the
+background answers the id of its terminal at once. The tools `BashOutput` and
+`KillBash` of the agent read its output and stop it, and a close of the session
+releases it. An editor that offers no terminals keeps the own `Bash` of Claude
+Code.
+
 The agent needs no Node.js and no API key. It uses the sign-in of Claude Code
 and reads no credential. To an editor that can run a sign-in in a terminal, it
 names the sign-in `claude-login`, which runs `claude-code-acp --login`. An editor
@@ -186,7 +201,8 @@ connection = open_connection(MyClient(), to_editor, to_agent)
 ```
 editor ──ACP──▶ claude-code-acp ──stream-json──▶ claude -p   (one process for each session)
                       │
-                      └── MCP server on 127.0.0.1: the permission tool
+                      └── MCP server on 127.0.0.1: the permission tool, and the
+                          Bash tool for an editor with terminals
 ```
 
 - Each session runs `claude -p --input-format stream-json --output-format
@@ -200,7 +216,14 @@ editor ──ACP──▶ claude-code-acp ──stream-json──▶ claude -p  
   refuses.
 - The agent serves a small MCP server on the loopback address, and gives Claude
   Code its tool with `--permission-prompt-tool`. Each session has its own
-  random bearer secret for it.
+  random bearer secret for it. For an editor that offers terminals, the server
+  also serves `Bash`, `BashOutput` and `KillBash`, which Claude finds without a
+  tool search (`_meta."anthropic/alwaysLoad"`), and `claude` runs with
+  `--disallowedTools=Bash`. `claude` names the tool call of a call of a tool in
+  the `_meta` of `tools/call`, as `claudecode/toolUseId`, so the agent knows
+  which card gets the terminal. The server then has a `timeout` of 10^8 ms in the
+  MCP configuration, since `claude` ends a call that gets no answer in a minute
+  otherwise.
 - `claude` gives each MCP server two minutes to connect (`MCP_TIMEOUT=120000`),
   unless the environment sets `MCP_TIMEOUT`. The servers of an editor that hosts
   the agent run in the process of the editor, which can be slow to answer its
