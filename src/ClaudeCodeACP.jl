@@ -21,7 +21,7 @@ import AgentClientProtocol as ACP
 using HTTP
 using JSON
 using Sockets
-using UUIDs: uuid4
+using UUIDs: UUID, uuid4
 using Random: RandomDevice
 
 export ClaudeCodeAgent, AgentSettings, serve_agent, close_agent!, make_login_command

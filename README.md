@@ -19,6 +19,11 @@ into the updates of the session:
 - the title of a new session, from its first prompt. A resumed session gets no
   new title, so the editor keeps the title that it has.
 
+An editor can fork a session with `session/fork`: the fork is a new session
+that starts with the history of the old one, up to its last answer at the
+request. The old session goes on as before, and a later answer of it does not
+reach the fork.
+
 Before Claude Code runs a tool that needs your word, the agent asks the editor,
 which shows you the question with "Allow", "Always allow" and "Reject". A cancel
 in the editor stops the turn. The mode, the model and the effort are options of
@@ -209,6 +214,15 @@ editor ──ACP──▶ claude-code-acp ──stream-json──▶ claude -p  
   stream-json --include-partial-messages`, with `--session-id` for a new
   session and `--resume` for a session that the editor resumes. A change of an
   option starts it again with `--resume` and the new flag.
+- A fork runs `claude` with `--resume <source> --fork-session --session-id
+  <fork> --resume-session-at <answer>` until its first prompt, because `claude`
+  writes the file of the fork only then. `<answer>` is the uuid of the last
+  record of an answer in the file of the source, which the agent reads at the
+  request from the folder `projects` of the configuration of `claude`
+  (`CLAUDE_CONFIG_DIR`, else `~/.claude`). So a start again before the first
+  prompt, as after a change of an option, copies the same history. A source
+  with no answer in a file gives the error `RESOURCE_NOT_FOUND`. The first
+  prompt of a fork names it.
 - The agent passes the setting `showThinkingSummaries` and, when `claude` takes
   it, the flag `--thinking-display summarized`, so the thinking of a recent
   model streams as text. The help of `claude` does not list that flag, so the

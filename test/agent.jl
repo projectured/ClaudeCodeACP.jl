@@ -170,6 +170,7 @@ count_usage(client) = count(update -> update isa ACP.UsageUpdate, client.updates
         @test answer.agent_info.name == "claude-code-acp"
         @test answer.agent_capabilities.session_capabilities.close !== nothing
         @test answer.agent_capabilities.session_capabilities.resume !== nothing
+        @test answer.agent_capabilities.session_capabilities.fork !== nothing
         @test answer.agent_capabilities.auth.logout !== nothing
         @test ACP.get_json(answer)["_meta"]["steering"]["supported"] === true
         # An editor that does not say that it runs a sign-in in a terminal gets no such method.
@@ -414,6 +415,85 @@ count_usage(client) = count(update -> update isa ACP.UsageUpdate, client.updates
         @test isempty(test.client.updates)
         @test length(fakes) == 1
         close_test_agent(test)
+    end
+
+    @testset "a fork copies its source up to the last answer at the request, also when claude starts again" begin
+        fakes = FakeClaude[]
+        source = "9c7e1f0a-2b3d-4e5f-8a6b-7c8d9e0f1a2b"
+        test = open_test_agent(AgentSettings(
+            start_claude = make_fake_starter([make_result_turn("first"), make_result_turn("second")]; fakes),
+            read_sign_in = command -> true, read_thinking_display = command -> true,
+            find_last_answer = (id, folder) -> id == source && folder == TEST_FOLDER ? "answer-1" : nothing))
+        answer = ACP.send_request!(test.connection, ACP.ForkSessionRequest(session_id = source, cwd = TEST_FOLDER);
+                                   timeout = 10)
+        fork = answer.session_id
+        @test fork != source
+        @test any(option -> option.id == "model", answer.config_options)
+        copy_arguments = ["--resume", source, "--fork-session", "--session-id", fork, "--resume-session-at", "answer-1"]
+        has_copy(arguments) = any(index -> arguments[index:index + length(copy_arguments) - 1] == copy_arguments,
+                                  1:length(arguments) - length(copy_arguments) + 1)
+        @test has_copy(only(fakes).arguments)
+        # A change of an option before the first prompt starts claude again,
+        # which copies the source again up to the same answer.
+        ACP.send_request!(test.connection, ACP.SetSessionConfigOptionRequestValueId(
+            session_id = fork, config_id = "model", value = "haiku"); timeout = 10)
+        @test send_test_prompt(test, fork, "Write a test for it.").stop_reason == "end_turn"
+        @test length(fakes) == 2
+        @test has_copy(fakes[2].arguments)
+        # The first prompt of a fork gives it a title of its own.
+        @test any(update -> update isa ACP.SessionInfoUpdate, test.client.updates)
+        # After its first prompt, the fork resumes as a session of its own.
+        ACP.send_request!(test.connection, ACP.SetSessionConfigOptionRequestValueId(
+            session_id = fork, config_id = "model", value = "sonnet"); timeout = 10)
+        @test send_test_prompt(test, fork, "Again.").stop_reason == "end_turn"
+        @test length(fakes) == 3
+        arguments = fakes[3].arguments
+        @test arguments[findfirst(==("--resume"), arguments) + 1] == fork
+        @test !("--fork-session" in arguments) && !("--resume-session-at" in arguments)
+        close_test_agent(test)
+    end
+
+    @testset "a fork of a session that claude does not keep is an error of the protocol" begin
+        fakes = FakeClaude[]
+        test = open_test_agent(AgentSettings(start_claude = make_fake_starter([]; fakes), read_sign_in = command -> true,
+                                             read_thinking_display = command -> true,
+                                             find_last_answer = (id, folder) -> nothing))
+        failure = try
+            ACP.send_request!(test.connection, ACP.ForkSessionRequest(
+                session_id = "9c7e1f0a-2b3d-4e5f-8a6b-7c8d9e0f1a2b", cwd = TEST_FOLDER); timeout = 10)
+        catch exception
+            exception
+        end
+        @test failure isa ACP.ProtocolException
+        @test failure.code == ACP.RESOURCE_NOT_FOUND
+        @test isempty(fakes)
+        close_test_agent(test)
+    end
+
+    @testset "the last answer of a session is its last record of an answer that no subagent wrote" begin
+        mktempdir() do config
+            id = "3f2b1c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d"
+            folder = joinpath(config, "projects", "-work-a-project")
+            mkpath(folder)
+            open(joinpath(folder, id * ".jsonl"), "w") do io
+                for record in (Dict("type" => "user", "uuid" => "u1"), Dict("type" => "assistant", "uuid" => "a1"),
+                               Dict("type" => "attachment", "uuid" => "t1"),
+                               Dict("type" => "assistant", "uuid" => "a2"),
+                               Dict("type" => "assistant", "uuid" => "s1", "isSidechain" => true),
+                               Dict("type" => "last-prompt"))
+                    println(io, JSON.json(record))
+                end
+                println(io, "a broken line that names \"assistant\"")
+            end
+            withenv("CLAUDE_CONFIG_DIR" => config) do
+                @test ClaudeCodeACP.find_claude_last_answer(id, "/work/a project") == "a2"
+                # A file in another subfolder is found by its name.
+                @test ClaudeCodeACP.find_claude_last_answer(id, "/elsewhere") == "a2"
+                @test ClaudeCodeACP.find_claude_last_answer("../" * id, "/work/a project") === nothing
+                @test ClaudeCodeACP.find_claude_last_answer("0b1c2d3e-4f5a-4b6c-8d7e-9f0a1b2c3d4e", "/work/a project") ===
+                      nothing
+            end
+        end
     end
 
     @testset "a resumed session keeps its title: its first prompt gives none" begin

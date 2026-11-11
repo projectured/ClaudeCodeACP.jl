@@ -2,7 +2,8 @@
 # with its own `claude` process.
 
 """
-    AgentSettings(; claude_command, strict_mcp_config, start_claude, read_sign_in, run_sign_out)
+    AgentSettings(; claude_command, strict_mcp_config, start_claude, read_sign_in, run_sign_out,
+                    read_thinking_display, find_last_answer)
 
 - `claude_command`    — the program `claude` and its first arguments.
 - `strict_mcp_config` — give `claude` only the MCP servers of the editor and the
@@ -16,6 +17,9 @@
   not; a test gives a fake.
 - `read_thinking_display(claude_command)` — answers whether `claude` takes the
   flag `--thinking-display`.
+- `find_last_answer(session_id, directory)` — answers the uuid of the last
+  answer of a session of `claude` in `directory`, or `nothing` when `claude`
+  keeps no answer of it; a test gives a fake.
 """
 Base.@kwdef struct AgentSettings
     claude_command::Vector{String} = ["claude"]
@@ -25,6 +29,7 @@ Base.@kwdef struct AgentSettings
     read_sign_in::Function = read_claude_sign_in
     run_sign_out::Function = run_claude_sign_out
     read_thinking_display::Function = read_claude_thinking_display
+    find_last_answer::Function = find_claude_last_answer
 end
 
 """
@@ -34,7 +39,9 @@ One session of the agent: its id, which is also the session id of `claude`, its
 folder, the MCP servers of the editor, the text that the editor adds to the
 system prompt, the secret of its permission tool and the private folder of its
 configuration, its options, its `claude` process, the translation of its events,
-and the state of its turns. While a prompt runs, `sent_messages` counts the user
+and the state of its turns. A fork names the session that it copies in
+`fork_session_id`, and the last answer of that session at the request in
+`fork_answer_uuid`; both are empty for a session that is no fork. While a prompt runs, `sent_messages` counts the user
 messages that went to `claude` for it, `taken_messages` the ones that `claude`
 echoed when a turn took them, `earlier_results` the `result`s of its `claude`
 that came or come before the one of its first message, `is_steerable` says that
@@ -57,6 +64,8 @@ mutable struct ClaudeSession
     process::Union{Nothing,ClaudeProcess}
     capabilities::Vector{String}
     has_history::Bool
+    fork_session_id::String
+    fork_answer_uuid::String
     needs_restart::Bool
     title::Union{Nothing,String}
     commands::Vector{String}
@@ -139,8 +148,9 @@ make_config_options(session::ClaudeSession) = ACP.SessionConfigOption[
 The command line of the `claude` of a session: print mode with stream-json in
 and out, the stream of partial messages, the text of the thinking with the
 setting `showThinkingSummaries` and, when `claude` takes it, the flag
-`--thinking-display summarized`, the permission tool, the session id or the
-session to resume, the options that the person chose, the file of the addition
+`--thinking-display summarized`, the permission tool, the session id, the
+session to resume, or for a fork with no prompt yet the session that it copies
+up to its answer at the request, the options that the person chose, the file of the addition
 to the system prompt when the editor gave one, and the file of the MCP
 configuration, which holds the secrets and so is not on the command line. For an
 editor that offers terminals, the own `Bash` of `claude` is off, and the tools
@@ -162,7 +172,16 @@ function make_claude_arguments(agent::ClaudeCodeAgent, session::ClaudeSession, m
     isempty(disallowed) || push!(arguments, "--disallowedTools=" * join(disallowed, ","))
     agent.has_terminals &&
         push!(arguments, "--allowedTools=" * join([BASH_OUTPUT_TOOL_NAME, KILL_BASH_TOOL_NAME], ","))
-    append!(arguments, session.has_history ? ["--resume", session.id] : ["--session-id", session.id])
+    if session.has_history
+        append!(arguments, ["--resume", session.id])
+    elseif !isempty(session.fork_session_id)
+        # `claude` writes the file of the fork only at its first prompt, so each
+        # start before it copies the source again, up to the same answer.
+        append!(arguments, ["--resume", session.fork_session_id, "--fork-session", "--session-id", session.id,
+                            "--resume-session-at", session.fork_answer_uuid])
+    else
+        append!(arguments, ["--session-id", session.id])
+    end
     for option in SESSION_OPTIONS
         option.id in session.chosen_options || continue
         value = session.options[option.id]
@@ -367,6 +386,54 @@ function read_claude_thinking_display(claude_command::Vector{String})
     process.exitcode != 0 && occursin("--thinking-display", String(take!(errors)))
 end
 
+# --- The file of a session ---------------------------------------------------
+
+"""
+    find_claude_last_answer(session_id, directory) -> Union{String,Nothing}
+
+The uuid of the last answer of the session `session_id` of `claude`: of its last
+record of the type `assistant` that is not the work of a subagent. `claude`
+keeps each session in one file, `<id>.jsonl`, with one JSON record on each
+line, in the folder `projects` of its configuration (`CLAUDE_CONFIG_DIR`, else
+`~/.claude`), in a subfolder that it names after `directory`. A file that is not
+in that subfolder is found by its name in the other subfolders. Answers
+`nothing` for an id that is no UUID, a session with no file, or a file with no
+answer.
+"""
+function find_claude_last_answer(session_id::AbstractString, directory::AbstractString)
+    path = _find_claude_session_file(session_id, directory)
+    path === nothing && return nothing
+    answer = nothing
+    for line in eachline(path)
+        occursin("\"assistant\"", line) || continue
+        record = try
+            JSON.parse(line)
+        catch exception
+            exception isa InterruptException && rethrow()
+            continue
+        end
+        record isa AbstractDict && get(record, "type", nothing) == "assistant" &&
+            get(record, "isSidechain", false) !== true || continue
+        uuid = get(record, "uuid", nothing)
+        uuid isa AbstractString && (answer = String(uuid))
+    end
+    answer
+end
+
+function _find_claude_session_file(session_id::AbstractString, directory::AbstractString)
+    tryparse(UUID, session_id) === nothing && return nothing
+    projects = joinpath(get(ENV, "CLAUDE_CONFIG_DIR", joinpath(homedir(), ".claude")), "projects")
+    name = session_id * ".jsonl"
+    path = joinpath(projects, replace(directory, r"[^A-Za-z0-9]" => "-"), name)
+    isfile(path) && return path
+    isdir(projects) || return nothing
+    for folder in readdir(projects; join = true)
+        candidate = joinpath(folder, name)
+        isfile(candidate) && return candidate
+    end
+    nothing
+end
+
 # Whether the command line of `claude` gets `--thinking-display`, read once.
 function _has_thinking_display!(agent::ClaudeCodeAgent)
     known = lock(() -> agent.has_thinking_display, agent.lock)
@@ -403,7 +470,8 @@ function ACP.answer_request(agent::ClaudeCodeAgent, request::ACP.InitializeReque
             prompt_capabilities = ACP.PromptCapabilities(image = true, audio = false, embedded_context = true),
             mcp_capabilities = ACP.McpCapabilities(http = true, sse = true),
             session_capabilities = ACP.SessionCapabilities(close = ACP.SessionCloseCapabilities(),
-                                                           resume = ACP.SessionResumeCapabilities()),
+                                                           resume = ACP.SessionResumeCapabilities(),
+                                                           fork = ACP.SessionForkCapabilities()),
             auth = ACP.AgentAuthCapabilities(logout = ACP.LogoutCapabilities())),
         agent_info = ACP.Implementation(name = "claude-code-acp", title = "Claude Code",
                                         version = string(pkgversion(@__MODULE__))),
@@ -477,13 +545,29 @@ function ACP.answer_request(agent::ClaudeCodeAgent, request::ACP.ResumeSessionRe
     ACP.ResumeSessionResponse(config_options = make_config_options(session))
 end
 
+# A fork is a new session with the history of its source up to the last answer
+# of the source at the request. A later answer of the source does not reach it.
+function ACP.answer_request(agent::ClaudeCodeAgent, request::ACP.ForkSessionRequest, context)
+    agent.connection = context.connection
+    _require_sign_in(agent)
+    answer_uuid = agent.settings.find_last_answer(request.session_id, request.cwd)
+    answer_uuid === nothing && throw(ACP.ProtocolException(ACP.RESOURCE_NOT_FOUND,
+        "Claude Code keeps no answer of the session `$(request.session_id)` in the folder `$(request.cwd)`."))
+    session = _open_session!(agent, string(uuid4()), request.cwd, something(request.mcp_servers, Any[]);
+                             has_history = false, fork_session_id = request.session_id,
+                             fork_answer_uuid = answer_uuid, system_prompt = read_system_prompt_addition(request.meta))
+    ACP.ForkSessionResponse(session_id = session.id, config_options = make_config_options(session))
+end
+
 function _open_session!(agent::ClaudeCodeAgent, id::String, directory::String, mcp_servers;
-                        has_history::Bool, system_prompt::String = "")
+                        has_history::Bool, system_prompt::String = "", fork_session_id::String = "",
+                        fork_answer_uuid::String = "")
     isabspath(directory) && isdir(directory) ||
         throw(ACP.ProtocolException(ACP.INVALID_PARAMS, "The folder `$(directory)` is no absolute path of a folder."))
     session = ClaudeSession(id, directory, collect(Any, mcp_servers), system_prompt, make_session_secret(), mktempdir(),
                             Dict(option.id => "default" for option in SESSION_OPTIONS), Set{String}(),
-                            nothing, String[], has_history, false, nothing, String[], Set{String}(),
+                            nothing, String[], has_history, fork_session_id, fork_answer_uuid, false, nothing,
+                            String[], Set{String}(),
                             SessionTranslation(id; features = agent.features), false, false, false, 0, 0, 0, false,
                             nothing, nothing, ACP.OutgoingRequest[], Set{String}(), ReentrantLock(), ReentrantLock())
     is_open = lock(agent.lock) do
