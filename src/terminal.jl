@@ -24,13 +24,6 @@ const MAX_COMMAND_MILLISECONDS = 600_000
 # its start.
 const OUTPUT_BYTE_LIMIT = 30_000
 
-# The time in milliseconds that `claude` gives each call of the MCP server of the
-# agent, as the `timeout` of the server, when the client offers terminals: the
-# limit of a call that `claude` names by default. Without it, `claude` 2.1.309
-# ends a call of an HTTP server that gives no answer in a minute, and a command
-# in the foreground runs up to ten.
-const BASH_CALL_MILLISECONDS = 100_000_000
-
 """
     make_bash_tools() -> Vector{Dict{String,Any}}
 

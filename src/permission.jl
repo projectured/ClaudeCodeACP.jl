@@ -54,15 +54,24 @@ Stop the server at once, also while a question waits for the person.
 """
 stop_permission_server!(permission::PermissionServer) = (HTTP.forceclose(permission.server); nothing)
 
+# The time in milliseconds that `claude` gives each call of the permission server,
+# as the `timeout` of the server: the limit of a call that `claude` names by
+# default. Without it, `claude` 2.1.309 ends a call of an HTTP server that gives no
+# answer in a minute, but a question of permission waits for the person, and a
+# command in the foreground runs up to ten minutes.
+const PERMISSION_SERVER_CALL_MILLISECONDS = 100_000_000
+
 """
     make_permission_mcp_server(permission, secret) -> Dict
 
 The entry of the MCP configuration of `claude` for the permission server, with
-the secret of one session in its header.
+the secret of one session in its header, and the time that `claude` gives each
+call of it, [`PERMISSION_SERVER_CALL_MILLISECONDS`](@ref).
 """
 make_permission_mcp_server(permission::PermissionServer, secret::AbstractString) = Dict{String,Any}(
     "type" => "http", "url" => "http://127.0.0.1:$(permission.port)/mcp",
-    "headers" => Dict{String,Any}("Authorization" => "Bearer " * secret))
+    "headers" => Dict{String,Any}("Authorization" => "Bearer " * secret),
+    "timeout" => PERMISSION_SERVER_CALL_MILLISECONDS)
 
 """
     make_session_secret() -> String

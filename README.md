@@ -235,9 +235,10 @@ editor ──ACP──▶ claude-code-acp ──stream-json──▶ claude -p  
   tool search (`_meta."anthropic/alwaysLoad"`), and `claude` runs with
   `--disallowedTools=Bash`. `claude` names the tool call of a call of a tool in
   the `_meta` of `tools/call`, as `claudecode/toolUseId`, so the agent knows
-  which card gets the terminal. The server then has a `timeout` of 10^8 ms in the
-  MCP configuration, since `claude` ends a call that gets no answer in a minute
-  otherwise.
+  which card gets the terminal. The server has a `timeout` of 10^8 ms in the
+  MCP configuration for every client, since `claude` ends a call that gets no
+  answer in a minute otherwise: a question of permission waits for the person,
+  and a command in the foreground runs up to ten minutes.
 - `claude` gives each MCP server two minutes to connect (`MCP_TIMEOUT=120000`),
   unless the environment sets `MCP_TIMEOUT`. The servers of an editor that hosts
   the agent run in the process of the editor, which can be slow to answer its

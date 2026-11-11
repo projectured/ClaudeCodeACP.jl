@@ -1258,7 +1258,8 @@ count_usage(client) = count(update -> update isa ACP.UsageUpdate, client.updates
         fake = only(fakes)
         @test "--disallowedTools=AskUserQuestion" in fake.arguments
         @test !any(argument -> startswith(argument, "--allowedTools"), fake.arguments)
-        @test !haskey(read_mcp_config(fake)["mcpServers"][ClaudeCodeACP.PERMISSION_SERVER_NAME], "timeout")
+        # A question of permission can wait for the person longer than a minute.
+        @test read_mcp_config(fake)["mcpServers"][ClaudeCodeACP.PERMISSION_SERVER_NAME]["timeout"] == 100_000_000
         @test [tool["name"] for tool in send_mcp_request(fake, "tools/list", Dict())["tools"]] == ["permission"]
         @test send_mcp_request(fake, "tools/call", Dict("name" => "Bash",
                                                         "arguments" => Dict("command" => "ls")))["code"] == -32602

@@ -207,9 +207,7 @@ function make_mcp_config(agent::ClaudeCodeAgent, session::ClaudeSession)
         config = _make_mcp_server_config(server)
         config === nothing || (servers[first(config)] = last(config))
     end
-    permission = make_permission_mcp_server(_get_or_start_permission_server!(agent), session.secret)
-    agent.has_terminals && (permission["timeout"] = BASH_CALL_MILLISECONDS)
-    servers[PERMISSION_SERVER_NAME] = permission
+    servers[PERMISSION_SERVER_NAME] = make_permission_mcp_server(_get_or_start_permission_server!(agent), session.secret)
     Dict{String,Any}("mcpServers" => servers)
 end
 
